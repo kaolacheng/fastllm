@@ -118,6 +118,7 @@ namespace fastllm {
         virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context) override;
         virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const override;
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const override;
+        virtual bool SupportsMediaKeyedPrefixCache() const override { return true; }
         virtual int GetChunkedPrefillSize() override;
 
         virtual int GetBatchedPrefillTokenLimit() override;
@@ -376,8 +377,12 @@ namespace fastllm {
         std::set<int> ggufGdnRestoredLayers;
         std::vector <int> mrope_sections = {11, 11, 10};
         bool visionPrepared = false;
+        bool skipVisionTower = false;
         bool multimodalWarmedUp = false;
         int visionWorkspaceMaxPatches = 0;
+        // Full media budget accepted at request time; the startup arena may be
+        // sized for a single encode chunk instead (see PrepareVision).
+        int visionMediaMaxPatches = 0;
         std::shared_ptr<CudaWorkspace> visionWorkspace;
         std::shared_ptr<Qwen35VisionTPState> visionTP;
         std::string visionDevice = "auto";
@@ -526,6 +531,10 @@ namespace fastllm {
         void RunDFlashLinear(Data &input, Data &weight, const Data &bias, Data &output, Data *halfInputScratch = nullptr);
         void RunDFlashGateupLinear(int device, Data &input,
                                    Data &linearWeight, Data &output);
+        void RunDFlashTpLinear(int device, Data &input,
+                               Data &linearWeight, Data &bias, Data &output,
+                               bool forceOutputGather,
+                               Data *halfInputScratch = nullptr);
         bool RunDFlashTensorParallelMlp(int device, Data &input,
                                        Data &gateupWeight,
                                        Data &downWeight, Data &output,

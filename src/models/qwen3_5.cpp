@@ -3,6 +3,7 @@
 //
 
 #include "utils.h"
+#include "utils/qwen35_mm_record_hook.h"
 
 #include "qwen3_5.h"
 #include "models/qwen3_5_paged_cache.h"
@@ -411,19 +412,52 @@ namespace fastllm {
             const std::string &name, const Data &data) {
         static const std::string gateupSuffix =
             ".mlp.gateup_proj.weight";
+        // 草稿 attention 的 q/k/v 在 TP 下保持独立（不做 fused_kv_qkv /
+        // mergeqkv 两级融合），因此可以按输出行分片并复用 output-gather：
+        // 32 个 Q 头 / 8 个 KV 头都能被卡数整除，每卡 Q 2048 行、K/V 各
+        // 512 行，正好落在头边界上。这两级融合的行布局是 [Q|K|V] 连续块，
+        // 按头切时每卡需要的行跨块不连续，所以才必须关掉融合。
+        static const std::string attentionSuffixes[3] = {
+            ".self_attn.q_proj.weight",
+            ".self_attn.k_proj.weight",
+            ".self_attn.v_proj.weight"};
         if (name.rfind("dflash.", 0) != 0 ||
-            name.size() < gateupSuffix.size() ||
+            data.dims.size() != 2 || data.isFake ||
+            data.cudaDataBorrowed) {
+            return false;
+        }
+        // dflash.fc.weight [5120, 25600]：把 5 层 target hidden 的拼接投影回
+        // 草稿隐空间。按输出维（dim0）行并行 + forceOutputGather，与草稿
+        // q/k/v 同一条路；不能按输入维列并行，原因见
+        // PrepareDFlashBackboneTensorParallelWeights 里的注释。
+        if (name == "dflash.fc.weight") {
+            return data.GetBytes() >= Qwen35DFlashTpMinWeightBytes();
+        }
+        for (const std::string &suffix : attentionSuffixes) {
+            if (name.size() >= suffix.size() &&
+                name.compare(name.size() - suffix.size(), suffix.size(),
+                             suffix) == 0) {
+                // q/k/v 是同一个逻辑 QKV 投影，k/v 只有 10 MiB、低于
+                // Qwen35DFlashTpMinWeightBytes() 的 32 MiB 门限，但三者
+                // 必须一起才能省下整块 QKV，所以这里绕过大张量门限。
+                // 注意：分片时必须同时设置 tpLinearType = TP_LINEAR_ROW
+                // （见 PrepareDFlashBackboneTensorParallelWeights），否则
+                // executor 会把源已释放的父权重当成普通张量去 stage 到
+                // CUDA，触发 "ToDevice Error: no CPU data to copy to CUDA"。
+                return data.GetBytes() >= (1ULL << 20);
+            }
+        }
+        if (name.size() < gateupSuffix.size() ||
             name.compare(name.size() - gateupSuffix.size(),
                          gateupSuffix.size(), gateupSuffix) != 0 ||
-            data.dims.size() != 2 || data.isFake ||
-            data.cudaDataBorrowed ||
             data.GetBytes() < Qwen35DFlashTpMinWeightBytes()) {
             return false;
         }
         // Restrict backbone TP to the five large, repeated fused gate/up
         // projections. They either use output-gather directly or pair with
-        // the matching down projection; attention, selector and context
-        // projections stay on the root until separately validated.
+        // the matching down projection; the attention q/k/v projections are
+        // handled above, while the selector and context projections stay on
+        // the root until separately validated.
         return true;
     }
 
@@ -442,6 +476,16 @@ namespace fastllm {
         return gateupName.substr(
                    0, gateupName.size() - gateupSuffix.size()) +
                downSuffix;
+    }
+    // 只有 gate/up 才有配对的 down 投影；q/k/v 也走 TP 分片（output-gather）
+    // 但不是配对 MLP，调用 Qwen35DFlashTpDownWeightName 前必须先过这一层，
+    // 否则会触发它内部的 Assert 直接中止进程。
+    static bool Qwen35DFlashTpGateupName(const std::string &name) {
+        static const std::string gateupSuffix =
+            ".mlp.gateup_proj.weight";
+        return name.size() >= gateupSuffix.size() &&
+               name.compare(name.size() - gateupSuffix.size(),
+                            gateupSuffix.size(), gateupSuffix) == 0;
     }
 
     static bool Qwen35DFlashTpPairedMlpEligible(
@@ -4836,6 +4880,11 @@ namespace fastllm {
             bool dflashValid = false;
             int dflashTokens = 0;
             std::vector<std::pair<Data, Data> > dflashKeyValues;
+            // 多模态前缀复用的安全键: 每张图的 256 位内容哈希 (与图片
+            // embedding 缓存同源, 由 Python 侧按实际像素/形状/grid/processor
+            // 设置算出). 图像占位 token 对不同图片是同一串 id, 因此多模态快照
+            // 必须同时比对图片键才能复用.
+            std::vector<std::string> mediaKeys;
         };
 
         static std::mutex &Qwen35LinearPrefixSnapshotsMutex() {
@@ -4859,6 +4908,54 @@ namespace fastllm {
             static auto *counter = new std::atomic<int>(0);
             return *counter;
         }
+
+        // 请求当前携带的图片内容键 (按图片顺序). 空表示纯文本请求, 或该多模态
+        // 请求没有可用键 (例如视频) —— 后者绝不允许参与前缀复用.
+        static std::vector<std::string> Qwen35SnapshotMediaKeys(const ResponseContext *context) {
+            std::vector<std::string> keys;
+            if (context == nullptr) {
+                return keys;
+            }
+            auto it = context->multimodalInput.find("image_cache_keys");
+            if (it == context->multimodalInput.end() || it->second.empty() ||
+                it->second[0] == nullptr) {
+                return keys;
+            }
+            const Data &keysData = *it->second[0];
+            if (keysData.dataType != DataType::INT32 || keysData.dims.size() != 2 ||
+                keysData.dims[1] != 8 || keysData.cpuData == nullptr) {
+                return keys;
+            }
+            const char *base = (const char*)keysData.cpuData;
+            keys.reserve(keysData.dims[0]);
+            for (int i = 0; i < keysData.dims[0]; i++) {
+                keys.emplace_back(base + (size_t)i * 32, 32);
+            }
+            return keys;
+        }
+
+        static bool Qwen35SnapshotMediaMatch(const Qwen35LinearPrefixSnapshot *snapshot,
+                                             const std::vector<std::string> &mediaKeys) {
+            return snapshot != nullptr && snapshot->mediaKeys == mediaKeys;
+        }
+
+        // 前缀缓存调试开关 (FASTLLM_PREFIX_CACHE_DEBUG=1): 输出到 stderr 避免块缓冲.
+        static bool Qwen35PrefixCacheDebugEnabled() {
+            static const bool enabled = std::getenv("FASTLLM_PREFIX_CACHE_DEBUG") != nullptr;
+            return enabled;
+        }
+
+        static bool Qwen35PrefixCacheDebugBudget() {
+            static std::atomic<int> budget(400);
+            return budget.fetch_sub(1) > 0;
+        }
+
+#define QWEN35_PC_DEBUG(...)                                                        \
+        do {                                                                        \
+            if (Qwen35PrefixCacheDebugEnabled() && Qwen35PrefixCacheDebugBudget()) { \
+                fprintf(stderr, "[PCDBG] " __VA_ARGS__);                            \
+            }                                                                       \
+        } while (0)
 
         static int Qwen35EnvInt(const char *name, int fallback) {
             const char *value = std::getenv(name);
@@ -5294,15 +5391,33 @@ namespace fastllm {
                 bool requireDFlash = false,
                 int dflashLayers = 0,
                 int dflashKvHeads = 0,
-                int dflashHeadDim = 0) {
+                int dflashHeadDim = 0,
+                const std::vector<std::string> *mediaKeys = nullptr) {
             auto &all = Qwen35LinearPrefixSnapshots();
             auto it = all.find(model);
             if (it == all.end()) {
                 return nullptr;
             }
             const Qwen35LinearPrefixSnapshot *best = nullptr;
+            QWEN35_PC_DEBUG("look: reqTokens=%zu maxLen=%d exact=%d requireMtp=%d reqMedia=%zu cands=%zu\n",
+                            tokens.size(), maxCachedLen, exactLen, (int)requireMtp,
+                            mediaKeys != nullptr ? mediaKeys->size() : (size_t)-1,
+                            it->second.size());
             for (auto &snapshotPtr : it->second) {
                 Qwen35LinearPrefixSnapshot *snapshot = snapshotPtr.get();
+                if (snapshot != nullptr) {
+                    bool tokRange = snapshot->cachedLen > 0 &&
+                                    snapshot->cachedLen <= maxCachedLen &&
+                                    snapshot->cachedLen <= (int)tokens.size() &&
+                                    (exactLen < 0 || snapshot->cachedLen == exactLen);
+                    bool tokEq = tokRange && (int)snapshot->tokens.size() == snapshot->cachedLen &&
+                                 std::equal(snapshot->tokens.begin(), snapshot->tokens.end(), tokens.begin());
+                    bool meEq = mediaKeys == nullptr || snapshot->mediaKeys == *mediaKeys;
+                    QWEN35_PC_DEBUG("look cand len=%d tokEq=%d snapTok=%zu snapMedia=%zu mediaEq=%d mtp=%d mtpTok=%d\n",
+                                    snapshot->cachedLen, (int)tokEq, snapshot->tokens.size(),
+                                    snapshot->mediaKeys.size(), (int)meEq,
+                                    (int)snapshot->mtpValid, snapshot->mtpTokens);
+                }
                 if (snapshot == nullptr || snapshot->cachedLen <= 0 ||
                     snapshot->cachedLen > maxCachedLen ||
                     snapshot->cachedLen > (int)tokens.size()) {
@@ -5313,6 +5428,10 @@ namespace fastllm {
                 }
                 if ((int)snapshot->tokens.size() != snapshot->cachedLen ||
                     !std::equal(snapshot->tokens.begin(), snapshot->tokens.end(), tokens.begin())) {
+                    continue;
+                }
+                // 多模态快照必须图片完全一致 (占位 token 相同但图不同 = 不可复用).
+                if (mediaKeys != nullptr && !Qwen35SnapshotMediaMatch(snapshot, *mediaKeys)) {
                     continue;
                 }
                 if (requireMtp &&
@@ -8149,6 +8268,11 @@ namespace fastllm {
             bool dflashValid = false;
             int dflashTokens = 0;
             std::vector<std::pair<Data, Data> > dflashKeyValues;
+            // 多模态前缀复用的安全键: 每张图的 256 位内容哈希 (与图片
+            // embedding 缓存同源, 由 Python 侧按实际像素/形状/grid/processor
+            // 设置算出). 图像占位 token 对不同图片是同一串 id, 因此多模态快照
+            // 必须同时比对图片键才能复用.
+            std::vector<std::string> mediaKeys;
         };
 
         static std::mutex &Qwen35LinearPrefixSnapshotsMutex() {
@@ -8172,6 +8296,54 @@ namespace fastllm {
             static auto *counter = new std::atomic<int>(0);
             return *counter;
         }
+
+        // 请求当前携带的图片内容键 (按图片顺序). 空表示纯文本请求, 或该多模态
+        // 请求没有可用键 (例如视频) —— 后者绝不允许参与前缀复用.
+        static std::vector<std::string> Qwen35SnapshotMediaKeys(const ResponseContext *context) {
+            std::vector<std::string> keys;
+            if (context == nullptr) {
+                return keys;
+            }
+            auto it = context->multimodalInput.find("image_cache_keys");
+            if (it == context->multimodalInput.end() || it->second.empty() ||
+                it->second[0] == nullptr) {
+                return keys;
+            }
+            const Data &keysData = *it->second[0];
+            if (keysData.dataType != DataType::INT32 || keysData.dims.size() != 2 ||
+                keysData.dims[1] != 8 || keysData.cpuData == nullptr) {
+                return keys;
+            }
+            const char *base = (const char*)keysData.cpuData;
+            keys.reserve(keysData.dims[0]);
+            for (int i = 0; i < keysData.dims[0]; i++) {
+                keys.emplace_back(base + (size_t)i * 32, 32);
+            }
+            return keys;
+        }
+
+        static bool Qwen35SnapshotMediaMatch(const Qwen35LinearPrefixSnapshot *snapshot,
+                                             const std::vector<std::string> &mediaKeys) {
+            return snapshot != nullptr && snapshot->mediaKeys == mediaKeys;
+        }
+
+        // 前缀缓存调试开关 (FASTLLM_PREFIX_CACHE_DEBUG=1): 输出到 stderr 避免块缓冲.
+        static bool Qwen35PrefixCacheDebugEnabled() {
+            static const bool enabled = std::getenv("FASTLLM_PREFIX_CACHE_DEBUG") != nullptr;
+            return enabled;
+        }
+
+        static bool Qwen35PrefixCacheDebugBudget() {
+            static std::atomic<int> budget(400);
+            return budget.fetch_sub(1) > 0;
+        }
+
+#define QWEN35_PC_DEBUG(...)                                                        \
+        do {                                                                        \
+            if (Qwen35PrefixCacheDebugEnabled() && Qwen35PrefixCacheDebugBudget()) { \
+                fprintf(stderr, "[PCDBG] " __VA_ARGS__);                            \
+            }                                                                       \
+        } while (0)
 
         static bool Qwen35LinearPrefixCacheEnabled() {
             return false;
@@ -8238,7 +8410,8 @@ namespace fastllm {
                 bool requireDFlash = false,
                 int dflashLayers = 0,
                 int dflashKvHeads = 0,
-                int dflashHeadDim = 0) {
+                int dflashHeadDim = 0,
+                const std::vector<std::string> *mediaKeys = nullptr) {
             (void)model;
             (void)tokens;
             (void)maxCachedLen;
@@ -8248,6 +8421,7 @@ namespace fastllm {
             (void)dflashLayers;
             (void)dflashKvHeads;
             (void)dflashHeadDim;
+            (void)mediaKeys;
             return nullptr;
         }
 
@@ -8883,6 +9057,12 @@ namespace fastllm {
     const std::string Qwen3_5Model::language_prefix = "model.language_model.";
     const std::string Qwen3_5Model::visual_prefix = "model.visual.";
 
+    // The CUDA vision encoder consumes patches in fixed-size chunks (see
+    // EncodeVisualItems).  The startup activation arena only has to cover one
+    // chunk: sizing it from the whole media budget reserved memory proportional
+    // to the worst-case image instead of the working set.
+    static constexpr int kQwen35VisionChunkPatches = 2048;
+
     static inline int ClampInt(int value, int low, int high) {
         return std::max(low, std::min(value, high));
     }
@@ -9108,8 +9288,19 @@ namespace fastllm {
         this->num_experts_per_tok = 0;
         this->norm_topk_prob = true;
 
+        const char *skipVisionEnv = std::getenv("FASTLLM_QWEN35_SKIP_VISION");
+        this->skipVisionTower = skipVisionEnv != nullptr &&
+                                (std::string(skipVisionEnv) == "1" ||
+                                 std::string(skipVisionEnv) == "true" ||
+                                 std::string(skipVisionEnv) == "yes");
+        if (this->skipVisionTower) {
+            printf("[Fastllm] Qwen3.5: FASTLLM_QWEN35_SKIP_VISION set; model.visual.* tower tensors will not be loaded.\n");
+        }
+
         weight.embeddingNames.insert(language_prefix + "embed_tokens.weight");
-        weight.embeddingNames.insert(visual_prefix + "pos_embed.weight");
+        if (!this->skipVisionTower) {
+            weight.embeddingNames.insert(visual_prefix + "pos_embed.weight");
+        }
         weight.linearNames = {
             "lm_head.weight",
             language_prefix + "layers.*.mlp.down_proj.weight", language_prefix + "layers.*.mlp.up_proj.weight",
@@ -9157,17 +9348,23 @@ namespace fastllm {
             "mtp.layers.*.self_attn.q_proj.weight",
             "mtp.layers.*.self_attn.k_proj.weight",
             "mtp.layers.*.self_attn.v_proj.weight",
-            "mtp.layers.*.self_attn.mergeqkv.weight",
-            visual_prefix + "patch_embed.proj.weight",
-            visual_prefix + "blocks.*.attn.qkv.weight",
-            visual_prefix + "blocks.*.attn.proj.weight",
-            visual_prefix + "blocks.*.mlp.linear_fc1.weight",
-            visual_prefix + "blocks.*.mlp.linear_fc2.weight",
-            visual_prefix + "merger.linear_fc1.weight",
-            visual_prefix + "merger.linear_fc2.weight",
-            visual_prefix + "deepstack_merger_list.*.linear_fc1.weight",
-            visual_prefix + "deepstack_merger_list.*.linear_fc2.weight"
+            "mtp.layers.*.self_attn.mergeqkv.weight"
         };
+        // The vision tower is a separate modality: a text-only deployment
+        // (FASTLLM_QWEN35_SKIP_VISION=1) never registers its weights, so the
+        // loader skips all model.visual.* tensors and frees that GPU memory
+        // for KV cache.  MTP weights are unaffected.
+        if (!this->skipVisionTower) {
+            weight.linearNames.insert(visual_prefix + "patch_embed.proj.weight");
+            weight.linearNames.insert(visual_prefix + "blocks.*.attn.qkv.weight");
+            weight.linearNames.insert(visual_prefix + "blocks.*.attn.proj.weight");
+            weight.linearNames.insert(visual_prefix + "blocks.*.mlp.linear_fc1.weight");
+            weight.linearNames.insert(visual_prefix + "blocks.*.mlp.linear_fc2.weight");
+            weight.linearNames.insert(visual_prefix + "merger.linear_fc1.weight");
+            weight.linearNames.insert(visual_prefix + "merger.linear_fc2.weight");
+            weight.linearNames.insert(visual_prefix + "deepstack_merger_list.*.linear_fc1.weight");
+            weight.linearNames.insert(visual_prefix + "deepstack_merger_list.*.linear_fc2.weight");
+        }
     }
 
     std::map <std::string, std::vector <std::pair <std::string, DataType> > >
@@ -9176,6 +9373,15 @@ namespace fastllm {
                   std::vector <std::pair <std::string, DataType> > > result;
         std::vector <std::string> targetNames;
         targetNames.reserve(tensorNames.size());
+        // Dense NVFP4 (ModelOpt W4A16) checkpoints keep their block scales as
+        // raw E4M3 companion tensors (.weight_scale plus the .weight_scale_2
+        // global multiplier).  Requesting the compact packed representation
+        // stores each scale as one byte per sixteen weights instead of an
+        // expanded float, which under tensor parallelism directly enlarges
+        // the KV pool headroom.  The loader validates the companion's on-disk
+        // dtypes before accepting the marker, so unrelated quantizations fall
+        // back to the ordinary auto policy.
+        std::set <std::string> tensorNamesSet(tensorNames.begin(), tensorNames.end());
         static const std::set <std::string> draftRootLinears = {
             "fc.weight",
             "candidate_selector.hidden_projection.weight"
@@ -9200,6 +9406,11 @@ namespace fastllm {
             "self_attn.q_norm.weight", "self_attn.k_norm.weight"
         };
         for (const std::string &name : tensorNames) {
+            // Second line of defense for text-only deployments: even if a
+            // visual name were registered, it must not enter the load set.
+            if (skipVisionTower && name.rfind(visual_prefix, 0) == 0) {
+                continue;
+            }
             if (dflashEnabled) {
                 const std::string mapped = "dflash." + name;
                 if (draftRootLinears.find(name) != draftRootLinears.end()) {
@@ -9247,6 +9458,17 @@ namespace fastllm {
                 if (name.rfind("mtp.", 0) == 0) {
                     continue;
                 }
+            }
+            // The scalar .weight_scale_2 multiplier has an empty shape and is
+            // filtered out of the mapper's name list, so it cannot be checked
+            // here; the load path resolves it from the full tensor dictionary
+            // and validates the U8/F8 companion pair before accepting the
+            // compact request.
+            if (StringEndWith(name, ".weight") &&
+                tensorNamesSet.count(name + "_scale")) {
+                result[name].push_back(
+                    {name, DataType::NVFP4_BLOCK_16_E4M3_PACKED});
+                continue;
             }
             targetNames.push_back(name);
         }
@@ -9611,9 +9833,16 @@ namespace fastllm {
                             2 * dflashKvHeads * dflashHeadDim * sizeof(uint16_t);
             // One append projects selected target features into all draft KV
             // layers. Its transient buffers are shared, not multiplied by B.
+            // Real per-token cost: combined input = embed_dim * |captured
+            // target hidden states| (the fc weight's 25600 = 5120 * 5 confirms
+            // the capture count), the projected fc output = embed_dim, and the
+            // k+v write scratch = 2 * layers * kvHeads * headDim. The old
+            // "2 * targetLayers + 4" rows over-charged this by ~2x.
+            const long long appendFeatureRows =
+                (long long)speculativeDFlashHiddenStates.size() + 2;
             reserveBytes += (long long)prefillTokens * sizeof(uint16_t) *
-                ((long long)embed_dim * (2 * dflashTargetLayerIds.size() + 4) +
-                 (long long)4 * dflashLayers * dflashKvHeads * dflashHeadDim);
+                ((long long)embed_dim * appendFeatureRows +
+                 (long long)2 * dflashLayers * dflashKvHeads * dflashHeadDim);
         }
         const int mtpDrafts = dflash ?
             std::min(DFlashDraftsPerStep(), QWEN35_MTP_PREFIX_SNAPSHOT_MAX) :
@@ -9752,7 +9981,8 @@ namespace fastllm {
             if (useDFlashTp && Qwen35DFlashTpPairedMlpRequested()) {
                 for (const auto &item : weight.weight) {
                     if (!Qwen35DFlashTpLinearEligible(
-                            item.first, item.second)) {
+                            item.first, item.second) ||
+                        !Qwen35DFlashTpGateupName(item.first)) {
                         continue;
                     }
                     const std::string downName =
@@ -9766,6 +9996,9 @@ namespace fastllm {
                 }
             }
             long long largestFallbackSource = 0;
+            const bool reserveDebug =
+                getenv("FASTLLM_DFLASH_RESERVE_DEBUG") != nullptr;
+            std::vector<std::pair<long long, std::string>> reserveDebugItems;
             long long ratioSum = 0;
             for (int tpDevice : devices) {
                 auto ratioIt = ratios.find(tpDevice);
@@ -9776,6 +10009,11 @@ namespace fastllm {
                 std::max(1, ratios.find(deviceId)->second);
             for (const auto &item : weight.weight) {
                 if (item.first.rfind("dflash.", 0) != 0 ||
+                    // FakeFrom 视图（all_kv / all_k_norm / layers.*.mergeqkv 等）
+                    // 与源张量 dflash.fused_kv_qkv.weight 共享同一块存储，
+                    // 源张量下面已单独计入；再算一遍会重复预留，而这些预留
+                    // 全部落在 root 卡上，直接把 KV 页数上限压低。
+                    item.second.isFake ||
                     item.first ==
                         "dflash.candidate_selector.predecessor_codebook" ||
                     item.first ==
@@ -9784,6 +10022,9 @@ namespace fastllm {
                 }
                 const long long bytes =
                     (long long)item.second.GetBytes();
+                if (reserveDebug) {
+                    reserveDebugItems.push_back({bytes, item.first});
+                }
                 const bool sharded = useDFlashTp &&
                     (Qwen35DFlashTpLinearEligible(item.first, item.second) ||
                      pairedDownWeightNames.count(item.first) != 0);
@@ -9808,6 +10049,21 @@ namespace fastllm {
             if (deviceId == devices.front()) {
                 reserveBytes += largestFallbackSource;
                 reserveBytes += (long long)(dflashHeadDim / 2) * sizeof(float);
+            }
+            if (reserveDebug) {
+                std::sort(reserveDebugItems.begin(), reserveDebugItems.end(),
+                          [](const std::pair<long long, std::string> &a,
+                             const std::pair<long long, std::string> &b) {
+                              return a.first > b.first;
+                          });
+                printf("[DFlash reserve] GPU %d: %zu 个草稿张量\n",
+                       deviceId, reserveDebugItems.size());
+                for (size_t i = 0; i < reserveDebugItems.size() && i < 14; i++) {
+                    printf("   %9.1f MB  %s\n",
+                           reserveDebugItems[i].first / 1e6,
+                           reserveDebugItems[i].second.c_str());
+                }
+                std::fflush(stdout);
             }
         }
         return reserveBytes;
@@ -10179,12 +10435,18 @@ namespace fastllm {
         if (context == nullptr ||
             !Qwen35LinearPrefixCacheEnabled() ||
             !Qwen35HasLinearAttentionLayers(this, this->block_cnt)) {
+            QWEN35_PC_DEBUG("rec bail top: ctx=%p enabled=%d linear=%d\n",
+                            (void*)context, (int)Qwen35LinearPrefixCacheEnabled(),
+                            (int)(context != nullptr && Qwen35HasLinearAttentionLayers(this, this->block_cnt)));
             return false;
         }
         int pageLen = fastllm::GetPageLen();
         int currentLen = Qwen35CurrentTokenGrowingCacheLen(this, this->block_cnt, context->pastKeyValues);
         if (currentLen <= 0 || currentLen > (int)context->allTokens.size() ||
             currentLen % pageLen != 0) {
+            QWEN35_PC_DEBUG("rec bail len: len=%d all=%zu pageLen=%d mm=%zu\n",
+                            currentLen, context->allTokens.size(), pageLen,
+                            context->multimodalInput.size());
             return false;
         }
         int lastSnapshotLen = context->intParams["qwen35_linear_prefix_last_len"];
@@ -10193,8 +10455,25 @@ namespace fastllm {
             return false;
         }
         int interval = Qwen35LinearPrefixSnapshotIntervalTokens();
-        if (snapshotCount > 0 && currentLen % interval != 0) {
+        // 相对间隔 (与上一个快照的距离) 而不是绝对取模: 多模态请求会在
+        // "视觉块之后第一个页对齐点"强制切一刀并立刻记录, 相位从此不再落在
+        // interval 的整数倍上; 用取模会把之后的快照全部挡掉, 反而只剩一个
+        // 很短的快照可用.
+        // 该边界处即使离上一个快照不足 interval 也要记 (例如 38912 之后
+        // 832 就是视觉块边界 39744): 图后那一份快照是后续所有增量轮次唯一
+        // 可用的长前缀, 否则每轮都要整段重算.
+        const bool forceSnapshot =
+            context->intParams["qwen35_force_prefix_snapshot"] > 0;
+        context->intParams["qwen35_force_prefix_snapshot"] = 0;
+        if (!forceSnapshot && snapshotCount > 0 &&
+            currentLen - lastSnapshotLen < interval) {
+            QWEN35_PC_DEBUG("rec bail interval: len=%d last=%d interval=%d\n",
+                            currentLen, lastSnapshotLen, interval);
             return false;
+        }
+        if (forceSnapshot) {
+            QWEN35_PC_DEBUG("rec force vision boundary: len=%d last=%d\n",
+                            currentLen, lastSnapshotLen);
         }
         int requestId = context->intParams["qwen35_linear_prefix_request_id"];
         if (requestId <= 0) {
@@ -10210,6 +10489,14 @@ namespace fastllm {
         snapshot->cachedLen = currentLen;
         snapshot->requestId = requestId;
         snapshot->tokens.assign(context->allTokens.begin(), context->allTokens.begin() + currentLen);
+        // 多模态请求必须带图片内容键才允许记录; 没有键 (如视频) 则完全跳过,
+        // 保持与旧行为一致的保守处理.
+        snapshot->mediaKeys = Qwen35SnapshotMediaKeys(context);
+        if (!context->multimodalInput.empty() && snapshot->mediaKeys.empty()) {
+            QWEN35_PC_DEBUG("rec bail keys: len=%d mmInput=%zu keys=0 (拒绝记录)\n",
+                            currentLen, context->multimodalInput.size());
+            return false;
+        }
         snapshot->layers.resize(this->block_cnt);
         for (int i = 0; i < this->block_cnt; i++) {
             if (!Qwen35LayerIsLinearAttention(this, i)) {
@@ -10269,6 +10556,11 @@ namespace fastllm {
                     mtpIt->second.key.dims[1] != currentLen ||
                     mtpIt->second.value.dims[1] != currentLen ||
                     !SnapshotMtpPagedCache(mtpIt->second, snapshot->mtpKey, snapshot->mtpValue)) {
+                    QWEN35_PC_DEBUG("rec bail mtp: len=%d found=%d mtpTokens=%d kdims=%zu vdims=%zu\n",
+                                    currentLen, (int)(mtpIt != mtpCaches.end()),
+                                    mtpIt != mtpCaches.end() ? mtpIt->second.tokens : -1,
+                                    mtpIt != mtpCaches.end() ? mtpIt->second.key.dims.size() : 0,
+                                    mtpIt != mtpCaches.end() ? mtpIt->second.value.dims.size() : 0);
                     return false;
                 }
                 snapshot->mtpValid = true;
@@ -10300,6 +10592,11 @@ namespace fastllm {
             snapshot->requestId = requestId;
             snapshot->timestamp = ++Qwen35LinearPrefixSnapshotTimestamp();
             items.push_back(std::move(snapshot));
+            QWEN35_PC_DEBUG("rec ok: len=%d media=%zu mtpValid=%d total=%zu\n",
+                            items.back() != nullptr ? items.back()->cachedLen : -1,
+                            items.back() != nullptr ? items.back()->mediaKeys.size() : 0,
+                            items.back() != nullptr ? (int)items.back()->mtpValid : -1,
+                            items.size());
             int maxPerRequest = Qwen35LinearPrefixSnapshotMaxPerRequest();
             int requestRecords = 0;
             for (auto &item : items) {
@@ -10371,12 +10668,33 @@ namespace fastllm {
         }
         bool requireMtp = RequiresMtpPrefixSnapshot(context);
         bool requireDFlash = RequiresDFlashPrefixSnapshot(context);
+        // 多模态请求没有可用图片键时不允许复用 (无法保证图片一致).
+        std::vector<std::string> mediaKeys = Qwen35SnapshotMediaKeys(context);
+        if (!context->multimodalInput.empty() && mediaKeys.empty()) {
+            return 0;
+        }
+        // 恢复边界必须越过最后一个视觉 token: 恢复后该请求按文本续写处理
+        // (不再进多模态 forward 重新编码视觉), 若边界切在视觉块内部, 剩余
+        // 的视觉 token 会被当普通文本 token 解码, 结果错误.
+        if (!context->multimodalInput.empty()) {
+            int visionEnd = -1;
+            for (int i = 0; i < (int)context->currentTokens.size(); i++) {
+                if (context->currentTokens[i] == image_token_id ||
+                    (video_token_id >= 0 &&
+                     context->currentTokens[i] == video_token_id)) {
+                    visionEnd = i + 1;
+                }
+            }
+            if (visionEnd >= 0 && maxCachedLen < visionEnd) {
+                return 0;
+            }
+        }
         std::lock_guard<std::mutex> guard(Qwen35LinearPrefixSnapshotsMutex());
         const Qwen35LinearPrefixSnapshot *snapshot =
             Qwen35FindLinearPrefixSnapshotLocked(
                 this, context->currentTokens, maxCachedLen, -1,
                 requireMtp, requireDFlash, dflashLayers,
-                dflashKvHeads, dflashHeadDim);
+                dflashKvHeads, dflashHeadDim, &mediaKeys);
         return snapshot == nullptr ? 0 : snapshot->cachedLen;
     }
 
@@ -10387,6 +10705,10 @@ namespace fastllm {
         }
         bool requireMtp = RequiresMtpPrefixSnapshot(context);
         bool requireDFlash = RequiresDFlashPrefixSnapshot(context);
+        std::vector<std::string> mediaKeys = Qwen35SnapshotMediaKeys(context);
+        if (!context->multimodalInput.empty() && mediaKeys.empty()) {
+            return false;
+        }
         const Qwen35LinearPrefixSnapshot *snapshot = nullptr;
         int restoredDFlashCacheTokens = 0;
         {
@@ -10394,7 +10716,7 @@ namespace fastllm {
             snapshot = Qwen35FindLinearPrefixSnapshotLocked(
                 this, context->currentTokens, cachedLen, cachedLen,
                 requireMtp, requireDFlash, dflashLayers,
-                dflashKvHeads, dflashHeadDim);
+                dflashKvHeads, dflashHeadDim, &mediaKeys);
             if (snapshot == nullptr || (int)snapshot->layers.size() < this->block_cnt) {
                 return false;
             }
@@ -18412,18 +18734,48 @@ namespace fastllm {
             if (validations % logInterval != 0) {
                 return;
             }
-            printf("[Qwen3.5 %s] pos_accept_rate=[",
+            // 指数移动平均(EMA): 累计计数器从不清零, 直接算比例得到的是"进程生命周期
+            // 平均", 历史越长越钝, 是假值。这里每次输出先取窗口增量, 再按 alpha 平滑,
+            // 反映的是"当前"接受率。alpha 是每次输出(每 logInterval 次验证)的权重。
+            constexpr double kAcceptEmaAlpha = 0.3;
+            static std::vector<double> emaRates;
+            static std::vector<long long> windowPrevAttempts;
+            static std::vector<long long> windowPrevAccepts;
+            static long long windowPrevValidations = 0;
+            if ((int)windowPrevAttempts.size() != mtpDraftsPerStep) {
+                emaRates.assign(mtpDraftsPerStep, -1.0);  // -1 = 尚未初始化
+                windowPrevAttempts.assign(mtpDraftsPerStep, 0);
+                windowPrevAccepts.assign(mtpDraftsPerStep, 0);
+                windowPrevValidations = 0;
+            }
+            long long windowValidations = validations - windowPrevValidations;
+            if (windowValidations <= 0) {
+                return;
+            }
+            printf("[Qwen3.5 %s] pos_accept_rate(EMA)=[",
                    useDFlash ? "DFlash2" : "MTP");
+            double acceptLen = 1.0;
             for (int i = 0; i < mtpDraftsPerStep; i++) {
                 long long attempts =
                     mtpDraftPositionAttempts[i].load(std::memory_order_relaxed);
                 long long accepts =
                     mtpDraftPositionAccepts[i].load(std::memory_order_relaxed);
-                double rate = attempts > 0 ?
-                    (double)accepts * 100.0 / (double)attempts : 0.0;
-                printf("%s%.2f%%", i == 0 ? "" : ", ", rate);
+                long long deltaAttempts = attempts - windowPrevAttempts[i];
+                long long deltaAccepts = accepts - windowPrevAccepts[i];
+                if (deltaAttempts > 0) {
+                    double rate = (double)deltaAccepts / (double)deltaAttempts;
+                    emaRates[i] = emaRates[i] < 0.0 ? rate :
+                        emaRates[i] * (1.0 - kAcceptEmaAlpha) + rate * kAcceptEmaAlpha;
+                }
+                double ema = emaRates[i] < 0.0 ? 0.0 : emaRates[i];
+                printf("%s%.2f%%", i == 0 ? "" : ", ", ema * 100.0);
+                acceptLen += ema;
+                windowPrevAttempts[i] = attempts;
+                windowPrevAccepts[i] = accepts;
             }
-            printf("].\n");
+            windowPrevValidations = validations;
+            printf("] accept_len=%.2f tokens/step (window=%lld validations, total=%lld validations).\n",
+                   acceptLen, windowValidations, validations);
             fflush(stdout);
         };
 
@@ -22719,19 +23071,46 @@ namespace fastllm {
 
         long long validations = mtpValidationCount.load(std::memory_order_relaxed);
         if (validations > 0 && validations % QWEN35_MTP_LOG_INTERVAL == 0) {
-            printf("[Qwen3.5 %s] pos_accept_rate=[",
-                   useDFlash ? "DFlash2" : "MTP");
-            for (int pos = 0; pos < draftsPerStep; pos++) {
-                long long attempts = mtpDraftPositionAttempts[pos].load(
-                    std::memory_order_relaxed);
-                long long accepts = mtpDraftPositionAccepts[pos].load(
-                    std::memory_order_relaxed);
-                double rate = attempts > 0 ?
-                    (double)accepts * 100.0 / (double)attempts : 0.0;
-                printf("%s%.2f%%", pos == 0 ? "" : ", ", rate);
+            // 指数移动平均(理由同 logMtpStats): 累计值直接算比例是假的。
+            constexpr double kAcceptEmaAlpha = 0.3;
+            static std::vector<double> emaRates;
+            static std::vector<long long> windowPrevAttempts;
+            static std::vector<long long> windowPrevAccepts;
+            static long long windowPrevValidations = 0;
+            if ((int)windowPrevAttempts.size() != draftsPerStep) {
+                emaRates.assign(draftsPerStep, -1.0);  // -1 = 尚未初始化
+                windowPrevAttempts.assign(draftsPerStep, 0);
+                windowPrevAccepts.assign(draftsPerStep, 0);
+                windowPrevValidations = 0;
             }
-            printf("].\n");
-            fflush(stdout);
+            long long windowValidations = validations - windowPrevValidations;
+            if (windowValidations > 0) {
+                printf("[Qwen3.5 %s] pos_accept_rate(EMA)=[",
+                       useDFlash ? "DFlash2" : "MTP");
+                double acceptLen = 1.0;
+                for (int pos = 0; pos < draftsPerStep; pos++) {
+                    long long attempts = mtpDraftPositionAttempts[pos].load(
+                        std::memory_order_relaxed);
+                    long long accepts = mtpDraftPositionAccepts[pos].load(
+                        std::memory_order_relaxed);
+                    long long deltaAttempts = attempts - windowPrevAttempts[pos];
+                    long long deltaAccepts = accepts - windowPrevAccepts[pos];
+                    if (deltaAttempts > 0) {
+                        double rate = (double)deltaAccepts / (double)deltaAttempts;
+                        emaRates[pos] = emaRates[pos] < 0.0 ? rate :
+                            emaRates[pos] * (1.0 - kAcceptEmaAlpha) + rate * kAcceptEmaAlpha;
+                    }
+                    double ema = emaRates[pos] < 0.0 ? 0.0 : emaRates[pos];
+                    printf("%s%.2f%%", pos == 0 ? "" : ", ", ema * 100.0);
+                    acceptLen += ema;
+                    windowPrevAttempts[pos] = attempts;
+                    windowPrevAccepts[pos] = accepts;
+                }
+                windowPrevValidations = validations;
+                printf("] accept_len=%.2f tokens/step (window=%lld validations, total=%lld validations).\n",
+                       acceptLen, windowValidations, validations);
+                fflush(stdout);
+            }
         }
 
         rollbackArmed = false;
@@ -23255,11 +23634,18 @@ namespace fastllm {
         };
 
         auto tryRestorePrefixCache = [&](ResponseContext *ctx) -> int {
-            // Restoring text-only KV here makes Qwen35ForwardMultimodal take
-            // its decode branch, skipping vision encoding and chunked prefill.
-            // Media-aware cache keys and position state are required first.
-            if (model->kvMemConfig.enabled || ctx == nullptr || !ctx->multimodalInput.empty() ||
+            if (model->kvMemConfig.enabled || ctx == nullptr ||
                 ctx->cacheLen != 0 || ctx->currentTokens.empty()) {
+                return 0;
+            }
+            // 带图请求的前缀恢复: 图片内容键 (image_cache_keys) 会在快照查询
+            // 与恢复里逐一比对, 键不一致时 QueryPagedPrefixCacheExtra 返回 0,
+            // 整段恢复自动放弃; 拿不到键 (如视频) 则一律不复用. 查询侧还要求
+            // 恢复边界越过全部视觉 token, 之后剩余 token 全是文本.
+            const bool multimodalRequest = !ctx->multimodalInput.empty();
+            if (multimodalRequest &&
+                (!model->SupportsMediaKeyedPrefixCache() ||
+                 Qwen35SnapshotMediaKeys(ctx).empty())) {
                 return 0;
             }
             auto probeRefs = model->GetPagedKVCacheManagers(model->kvCacheId, true);
@@ -24086,6 +24472,14 @@ namespace fastllm {
                             tryRestorePrefixCache(ctx) < 0) {
                             releaseAndReinitRequest(ctx);
                         }
+                        if (ctx->cacheLen > 0 && !ctx->multimodalInput.empty()) {
+                            // 已恢复带图前缀, 但剩余待 prefill 的尾巴是纯文本
+                            // (视觉 token 全部落在前缀内, 由查询侧保证). 走文本
+                            // 续写路径: 多模态 forward 要求全序列的占位 token 与
+                            // mm/mrope 张量, 尾巴无法满足. 位置由调用侧叠加
+                            // mrope_position_delta 修正.
+                            isMultimodal = false;
+                        }
                         scheduledTokens =
                             (int)ctx->currentTokens.size();
                         // Prefix restore has already acquired its pages.
@@ -24257,7 +24651,45 @@ namespace fastllm {
                 Data inputIds(DataType::FLOAT32, {1, (int)ids.size()}, ids);
                 Data multimodalAdjustedPositionIds;
                 std::vector<Data*> forwardPositionIds = positionIds;
-                if (selectedMultimodal && !selectedIsPrompt &&
+                // 带图请求恢复前缀后只 prefill 纯文本尾巴: 直接从全序列
+                // M-RoPE 位置里切出尾巴对应的列, 与冷启动逐位一致. 图后文本的
+                // 位置不等于 token 序号 (视觉 token 数 - max(H,W)/merge 的差),
+                // 而多模态 forward 要求全序列占位 token 与 mm/mrope 张量, 所以
+                // 尾巴必须走文本路径 + 真实位置列.
+                const bool restoredMultimodalContinuation =
+                    singleContext != nullptr &&
+                    !singleContext->multimodalInput.empty() &&
+                    singleContext->cacheLen > 0;
+                if (restoredMultimodalContinuation) {
+                    auto mropeIt = singleContext->multimodalInput.find(
+                        "mrope_position_ids");
+                    const int fullLen = singleContext->cacheLen +
+                        (int)singleContext->currentTokens.size();
+                    if (mropeIt != singleContext->multimodalInput.end() &&
+                        !mropeIt->second.empty() &&
+                        mropeIt->second[0] != nullptr &&
+                        mropeIt->second[0]->dims.size() == 2 &&
+                        mropeIt->second[0]->dims[1] == fullLen) {
+                        Split(*mropeIt->second[0], 1, singleContext->cacheLen,
+                              fullLen, multimodalAdjustedPositionIds);
+                        forwardPositionIds[0] = &multimodalAdjustedPositionIds;
+                    } else if (!positionIds.empty() && positionIds[0] != nullptr) {
+                        // 兜底: 没拿到全序列 M-RoPE 时按 delta 修正位置.
+                        auto deltaIt = singleContext->multimodalInput.find(
+                            "mrope_position_delta");
+                        if (deltaIt != singleContext->multimodalInput.end() &&
+                            !deltaIt->second.empty() &&
+                            deltaIt->second[0] != nullptr) {
+                            model->AdjustPositionIdsWithDelta(
+                                *positionIds[0], *deltaIt->second[0],
+                                multimodalAdjustedPositionIds);
+                        } else {
+                            multimodalAdjustedPositionIds.CopyFrom(
+                                *positionIds[0]);
+                        }
+                        forwardPositionIds[0] = &multimodalAdjustedPositionIds;
+                    }
+                } else if (selectedMultimodal && !selectedIsPrompt &&
                     singleContext != nullptr && !positionIds.empty() &&
                     positionIds[0] != nullptr) {
                     auto deltaIt = singleContext->multimodalInput.find(
@@ -25380,9 +25812,32 @@ namespace fastllm {
             }
             const bool fuseDflashLinear = Qwen35EnvDefaultEnabled(
                 "FASTLLM_CUDA_DFLASH_FUSED_LINEAR");
+            // TP 下 q/k/v 必须保持独立。两级融合产生的行布局都无法按头切分：
+            //   * 跨层 dflash.fused_kv_qkv.weight = [各层 K|V] + [各层 Q|K|V]
+            //   * 逐层 self_attn.mergeqkv.weight  = [Q|K|V]
+            // 每卡需要的是「每个块内的连续半段」，跨块并不连续，无法用
+            // FakeFrom 偏移视图表达，只能整块落在 root 卡（419 MB）。
+            // 保持独立 q/k/v 后即可走标准 qkv 分片（各卡算自己那半头再做
+            // output-gather，attention 仍读完整 QKV，数值与融合路径逐位一致）。
+            std::vector<int> dflashAttnTpDevices;
+            std::map<int, int> dflashAttnTpRatios;
+            const bool dflashTpAttention =
+                GetQwen35GPUForwardDevices(this->deviceMap,
+                                           dflashAttnTpDevices,
+                                           dflashAttnTpRatios) &&
+                dflashAttnTpDevices.size() > 1 &&
+                Qwen35DFlashBackboneTpEnabledFor(dflashAttnTpDevices,
+                                                 dflashAttnTpRatios);
             const bool fuseDflashKvProjection = fuseDflashLinear &&
+                !dflashTpAttention &&
                 Qwen35EnvDefaultEnabled(
                     "FASTLLM_CUDA_DFLASH_FUSED_KV_PROJECTION");
+            // dflash.fc.weight 的列并行分片交给 MultiCudaLinearOp 在首次前向
+            // 按需完成：它自己会调 SplitMultiCudaWeight（backtrace 实测），
+            // 此时 CPU 源还在，能成功；这里只标 tpLinearType 并跳过手工切分
+            // ——（a）手工切会释放源，op 再切一次就报 ToDevice 错；（b）走
+            // AddSpecialWeight 的标准注册则因为 dflash. 张量不在常规放置流程
+            // 里而报 "failed to move weight to CUDA root device 0"。
             std::vector<std::string> fusedDflashKvQkvInputs;
             if (fuseDflashKvProjection) {
                 fusedDflashKvQkvInputs.reserve(5 * dflashLayers);
@@ -25427,13 +25882,15 @@ namespace fastllm {
                         prefix + "mlp.up_proj.weight";
                     const std::string gateupWeightName =
                         prefix + "mlp.gateup_proj.weight";
-                    this->weight.linearNames.insert(mergeQkvWeightName);
                     this->weight.linearNames.insert(gateupWeightName);
+                    if (!dflashTpAttention) {
+                        this->weight.linearNames.insert(mergeQkvWeightName);
+                    }
                     if (fuseDflashKvProjection) {
                         fusedDflashKvQkvInputs.push_back(qWeightName);
                         fusedDflashKvQkvInputs.push_back(kWeightName);
                         fusedDflashKvQkvInputs.push_back(vWeightName);
-                    } else {
+                    } else if (!dflashTpAttention) {
                         this->weightMergeRules.push_back(WeightMergeRule({
                             WeightMergeRuleSingle(
                                 {qWeightName, kWeightName, vWeightName},
@@ -27030,11 +27487,27 @@ namespace fastllm {
             warmImage(vision_spatial_merge_size, vision_spatial_merge_size);
             const int merge = vision_spatial_merge_size;
             visionWorkspaceMaxPatches = maxPatches;
+            // A chunked encode materialises at most kQwen35VisionChunkPatches
+            // rows at a time, so the arena is sized for one chunk while the
+            // request-time check keeps the full media budget.
+            const bool chunkedVisionEncode = this->dataType != DataType::FLOAT32;
+            if (chunkedVisionEncode && visionWorkspaceMaxPatches > kQwen35VisionChunkPatches) {
+                visionWorkspaceMaxPatches = kQwen35VisionChunkPatches;
+            }
+            visionMediaMaxPatches = chunkedVisionEncode ? maxPatches : visionWorkspaceMaxPatches;
             if (visionWorkspaceMaxPatches < merge * merge) {
                 throw std::runtime_error("Multimodal patch budget is smaller than one merged image token");
             }
             const size_t elementBytes = this->dataType == DataType::FLOAT32 ? 4 : 2;
             const size_t granularity = 64ULL * 1024 * 1024;
+            // Fixed margin for the bounded chunk-row MLP scratch, the cuBLAS
+            // scratch and allocator slack.  512 MiB dominated the arena once
+            // the arena itself became chunk-sized, so allow tuning it down.
+            size_t visionWorkspaceMarginBytes = 512ULL * 1024 * 1024;
+            if (const char *marginMbEnv = std::getenv("FASTLLM_QWEN35_MM_WORKSPACE_MARGIN_MB")) {
+                const int marginMb = ClampInt(atoi(marginMbEnv), 16, 4096);
+                visionWorkspaceMarginBytes = (size_t)marginMb * 1024 * 1024;
+            }
             auto reserveWorkspace = [&](int gpu, int heads, int intermediate) {
                 // Six full hidden buffers cover FP32 partial output (2x),
                 // half residual (1x), and its half->FP32 copy transition (3x).
@@ -27048,7 +27521,7 @@ namespace fastllm {
                     : std::max((size_t)vision_hidden_size * 10,
                                (size_t)vision_intermediate_size * 2);
                 size_t bytes = (size_t)visionWorkspaceMaxPatches * channels * elementBytes +
-                               512ULL * 1024 * 1024;
+                               visionWorkspaceMarginBytes;
                 bytes = (bytes + granularity - 1) / granularity * granularity;
                 auto workspace = std::make_shared<CudaWorkspace>(gpu, bytes);
                 printf("[Vision] Multimodal warmup before KV cache: cuda:%d, heads=%d, max patches=%d, fixed workspace=%.2f MiB.\n",
@@ -27443,7 +27916,7 @@ namespace fastllm {
             };
             gridThwList.push_back(grid);
             const long long mediaPatches = (long long)grid[0] * grid[1] * grid[2];
-            if (visionWorkspaceMaxPatches > 0 && mediaPatches > visionWorkspaceMaxPatches) {
+            if (visionMediaMaxPatches > 0 && mediaPatches > visionMediaMaxPatches) {
                 throw std::runtime_error("Image/video exceeds the startup multimodal patch budget; resize media before encoding");
             }
 
@@ -27773,7 +28246,7 @@ namespace fastllm {
             Data pixelInput(pixelType, {patchCount, patchDim}, patchTokens);
 
 
-            constexpr int visionTokenChunkSize = 2048;
+            constexpr int visionTokenChunkSize = kQwen35VisionChunkPatches;
             constexpr int visionMergerChunkSize = 512;
             bool useCudaVisionChunks = false;
 #ifdef USE_CUDA
@@ -28937,6 +29410,40 @@ namespace fastllm {
         return mode.empty() ? "off" : mode;
     }
 
+#ifdef USE_CUDA
+    // headroom = 输入被压到的上界（2 的幂缩放后 |x/s| ≤ headroom）。
+    // GEMM 输出满足 |y/s| ≤ headroom · wBound（wBound = max_c Σ_j|W_cj|），
+    // 所以要让它落在 FP16 内必须 headroom ≤ 65504 / wBound。
+    // 原来写死 8.0f 是按 wBound≈8192 估的，正好卡在上限上（实测仍有 8 个
+    // inf），因此改为默认 1.0f（wBound ≤ 65504 即安全，留 ~8 倍余量），
+    // 并开放 env 便于扫描。缩放走 2 的幂，不引入额外舍入误差。
+    static float Qwen35DFlashScaleHeadroom() {
+        static const float value = []() {
+            const char *env = std::getenv("FASTLLM_DFLASH_SCALE_HEADROOM");
+            if (env != nullptr && env[0] != '\0') {
+                const float v = (float) atof(env);
+                if (std::isfinite(v) && v > 0.0f) {
+                    return v;
+                }
+            }
+            return 1.0f;
+        }();
+        return value;
+    }
+
+    // 诊断/探针总开关。启动脚本会把 FASTLLM_DFLASH_PROBE=0 显式传进来，
+    // 因此这里把 "0"/"false"/"off" 也当关闭，而不是只看 getenv 是否为 null。
+    static bool Qwen35DFlashDiagEnabled() {
+        static const bool enabled = []() {
+            const char *env = std::getenv("FASTLLM_DFLASH_PROBE");
+            return env != nullptr && env[0] != '\0' &&
+                   std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 &&
+                   std::strcmp(env, "FALSE") != 0 && std::strcmp(env, "off") != 0;
+        }();
+        return enabled;
+    }
+#endif
+
     // Quantized draft projections keep their original BF16 activation boundary.
     // The existing NVFP4 Marlin route consumes FP16; never feed its packed
     // weights to the generic BF16 GEMV implementation.
@@ -28947,15 +29454,63 @@ namespace fastllm {
             Linear(input, linearWeight, bias, output);
             return;
         }
+        // ── DFlash2 逐行激活缩放保护（方案 b）──────────────────────────
+        // 这台机器上唯一正确的 NVFP4 GEMM
+        // (FastllmCudaTryNativeNvfp4Linear) 是 FP16 进 / FP16 出的，绕不开。
+        // 而 DFlash2 的 GEMM 输出峰值会超过 65504（实测 L0 attn.o_proj
+        // amax=59904 且已有 inf），存成 half 就是 inf；inf 一旦进入后面的
+        // RMSNorm 会立刻摊满整个张量，最终让 selector 选出越界候选 id 中止进程。
+        // 做法：按行（token）取 absmax 推出 2 的幂 scale s_i，输入除以 s_i 再进
+        // GEMM —— y = W·x 逐行独立，FP16 出口也就自动缩小 s_i 倍，出来再乘回。
+        // 逐行而非全局：实测越界值是稀疏离群点（40960 里只有 11~17 个），
+        // 全局 scale 会把 O(1) 的主体压进 FP16 次正规区变成 0。
+        // s_i 为 2 的幂 ⇒ FP32 下乘除精确，正常范围内不丢任何尾数。
         Data temporaryHalfInput;
         Data &halfInput = halfInputScratch ? *halfInputScratch : temporaryHalfInput;
-        Data *source = &input;
-        if (input.dataType != DataType::FLOAT16) {
-            ToDataType(input, halfInput, DataType::FLOAT16);
-            source = &halfInput;
+        Data *source = nullptr;
+        bool scaled = false;
+#ifdef USE_CUDA
+        // 只在"本来就要复制一份 FP16"的场合做缩放，绝不新增显存占用：
+        //   * BF16 输入：原实现必须 cast 到 FP16，缩放搭这趟车；
+        //   * FP16 输入且调用方给了 scratch：复用已有预分配缓冲。
+        // FP16 输入且无 scratch 时保持原实现（直接用输入、不复制）——
+        // 引擎常以 gpu_mem_ratio=1.00 吃满显存，而 Data::Allocate 失败是
+        // 致命中止（不是可返回的错误），多一份 buffer 就可能把进程打死。
+        const bool canScale =
+            input.dataType == DataType::BFLOAT16 ||
+            (input.dataType == DataType::FLOAT16 && halfInputScratch != nullptr);
+        if (canScale) {
+            scaled = FastllmCudaDFlashScaleToHalf(input, halfInput,
+                                                  Qwen35DFlashScaleHeadroom());
+            if (scaled) {
+                source = &halfInput;
+            }
+        }
+#endif
+        if (!scaled) {
+            if (input.dataType == DataType::FLOAT16) {
+                source = &input;
+            } else {
+                ToDataType(input, halfInput, DataType::FLOAT16);
+                source = &halfInput;
+            }
         }
         Linear(*source, linearWeight, bias, output);
-        ToDataType(output, input.dataType);
+        if (Qwen35DFlashDiagEnabled()) {
+            printf("[RunDFlashLinear] inType=%d scaled=%d scratch=%d rows=%d m=%d\n",
+                   (int)input.dataType, (int)scaled,
+                   (int)(halfInputScratch != nullptr),
+                   input.dims.empty() ? -1 : (int)(input.Count(0) / input.dims.back()),
+                   input.dims.empty() ? -1 : (int)input.dims.back());
+            fflush(stdout);
+        }
+        bool scaledBack = false;
+#ifdef USE_CUDA
+        scaledBack = scaled && FastllmCudaDFlashScaleBack(output, input);
+#endif
+        if (!scaledBack) {
+            ToDataType(output, input.dataType);
+        }
     }
 
 #ifdef USE_CUDA
@@ -29011,9 +29566,16 @@ namespace fastllm {
         for (Data *w : locals) {
             if (!w || w->multiDeviceData || w->isFake || w->cudaDataBorrowed ||
                 w->dataDevice != DataDevice::CUDA || w->dataDeviceIds.size() != 1 ||
-                !w->cudaData || w->dims.size() != 2 ||
-                (w->dataType != DataType::FLOAT16 && w->dataType != DataType::BFLOAT16)) return false;
+                !w->cudaData || w->dims.size() != 2) return false;
             FastllmCudaSetDevice(w->dataDeviceIds[0]);
+            if (w->dataType == DataType::FLOAT32) {
+                // 带标量 weight_scale 的 FP8 草稿权重会以 FLOAT32 载入
+                // （model.cpp 的 F8_E4M3 去量化分支）。NVFP4 量化器只接受
+                // 16 位/FP8 入口，这里先原地降到 BF16；不这么做的话量化会
+                // 整体失败，草稿权重会一直以 FP32 常驻（显存 4 倍）。
+                ToDataType(*w, DataType::BFLOAT16);
+            }
+            if (w->dataType != DataType::FLOAT16 && w->dataType != DataType::BFLOAT16) return false;
             if (!FastllmCudaMarlinNVFP4Supported(w->dims[0], w->dims[1])) return false;
         }
         std::vector<Data> converted(locals.size());
@@ -29259,7 +29821,8 @@ namespace fastllm {
                     continue;
                 }
                 deferredTpLinearWeights.insert(item.first);
-                if (!Qwen35DFlashTpPairedMlpRequested()) {
+                if (!Qwen35DFlashTpPairedMlpRequested() ||
+                    !Qwen35DFlashTpGateupName(item.first)) {
                     continue;
                 }
                 const std::string downName =
@@ -29593,7 +30156,8 @@ namespace fastllm {
         if (Qwen35DFlashTpPairedMlpRequested()) {
             for (auto &item : weight.weight) {
                 Data &gateup = item.second;
-                if (!Qwen35DFlashTpLinearEligible(item.first, gateup)) {
+                if (!Qwen35DFlashTpLinearEligible(item.first, gateup) ||
+                    !Qwen35DFlashTpGateupName(item.first)) {
                     continue;
                 }
                 const std::string downName =
@@ -29663,13 +30227,27 @@ namespace fastllm {
                         item.first + ".\n");
             } else {
                 std::vector<int> deviceCopy = devices;
+                // fc 是列并行（切输入维、输出 all-reduce），与 down_proj 同构；
+                // q/k/v 是行并行（切输出维、收集即完整输出）与 gateup 同构。
+                // 两者都必须显式声明 tpLinearType，executor 才会走
+                // multiDeviceDatas 分片路径；否则它会去 stage 源已释放的父权重
+                // 视图而报 "no CPU data to copy to CUDA"。
+                // fc 和 q/k/v 走同一条路：按输出维 dim0 行并行 + forceOutputGather
+                // 收齐。不能按输入维列并行 —— 框架的 RunMultiCudaColumnLinear
+                // 要求 input.IsTensorParallelSharded() 并从 input.tpRanges 取切分
+                // 方案，而这里每卡的 combined 输入是完整的（25600 宽），于是它
+                // return false，落到兜底分支再对已切好的权重调一次
+                // SplitMultiCudaWeight，把整块 [5120,25600] BF16 = 250MB 搬回
+                // root（实测 ~2.5 份 = 618.8MB，正是显存不对齐的全部来源），
+                // 内存紧张时还会 OOM 起不来。
+                linearWeight.tpLinearType = TP_LINEAR_ROW;
                 DivisionScheme scheme = BuildMultiCudaRowSplitScheme(
                     linearWeight, deviceCopy, ratios);
                 Data emptyBias;
                 AssertInFastLLM(
                     SplitMultiCudaWeight(
-                        linearWeight, emptyBias, deviceCopy, scheme, 0,
-                        true, true),
+                        linearWeight, emptyBias, deviceCopy, scheme,
+                        0, true, true),
                     "DFlash TP failed to split " + item.first + ".\n");
             }
             convertTpShardsToFp16(linearWeight);
@@ -29681,7 +30259,12 @@ namespace fastllm {
         if (Qwen35DraftQuantMode() == "nvfp4") {
             for (auto &item : weight.weight) {
                 Data &gateup = item.second;
+                // 只量化 gate/up(/down)：q/k/v 在草稿检查点里被显式排除在
+                // 量化之外（compressed-tensors 的 ignore 列表），它们现在
+                // 也会被 TP 分片，但必须保持 FP16/BF16，否则 attention
+                // 的数值会偏离参考实现。
                 if (!Qwen35DFlashTpLinearEligible(item.first, gateup) ||
+                    !Qwen35DFlashTpGateupName(item.first) ||
                     !Qwen35DFlashHasTpShards(gateup, devices)) continue;
                 if (pairedGateupNames.count(item.first)) {
                     Qwen35QuantizeDraftWeights({&gateup, &weight[Qwen35DFlashTpDownWeightName(item.first)]});
@@ -29750,9 +30333,36 @@ namespace fastllm {
         Qwen3CudaDirectRunner &runner = Qwen35DFlashThreadLocalRunner(device);
         Data halfInput;
         Data *source = &input;
-        if (head->dataType == DataType::NVFP4_BLOCK_16 && input.dataType != DataType::FLOAT16) {
-            halfInput.CopyFrom(input);
-            qwen3cuda::Qwen3CudaToDataType(runner, halfInput, DataType::FLOAT16);
+        bool scaled = false;
+        // 草稿用的是**目标模型**的 lm_head（W4A4 → NVFP4_BLOCK_16_E4M3_PACKED）。
+        // 原生 NVFP4 内核只认 FP16 入口：DoCudaLinear 见到非 FP16 输入会把权重
+        // 从 native layout 还原成通用 layout（cudadevice.cpp:6263），而 1012 的
+        // 通用路径会算出约 62% 的 NaN logits，top-k 于是吐回哨兵 id，最后中止在
+        // "DFlash selector candidate id is out of range"。基线只为 1006 做了
+        // FP16 转换，1012 是后来新增的类型，这条草稿路径漏了。
+        const bool nvfp4DraftHead =
+            head->dataType == DataType::NVFP4_BLOCK_16 ||
+            head->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
+            head->dataType == DataType::NVFP4_BLOCK_16_PLANAR ||
+            head->dataType == DataType::NVFP4_BLOCK_16_E8M0 ||
+            head->dataType == DataType::NVFP4_BLOCK_32_E8M0;
+        if (nvfp4DraftHead && input.dataType == DataType::FLOAT32) {
+            // FP32 残差路径：dflash.norm 之后数值是 O(1)，直接 cast FP16 即可。
+            // 不能用逐行缩放——缩放后的还原（ScaleBack）只支持 F16/BF16 出口，
+            // FP32 出口会还原失败、logits 整体留在 1/s 上。
+            ToDataType(input, halfInput, DataType::FLOAT16);
+            source = &halfInput;
+        } else if (nvfp4DraftHead && input.dataType != DataType::FLOAT16) {
+            // 草稿的最终 hidden 会到 1e11 量级（残差是逐层累加的运行和），
+            // 裸 cast 成 FP16 就是 inf，logits 全 inf/NaN，top-k 会选出越界
+            // 候选 id（实测中止在 "DFlash selector candidate id is out of
+            // range"）。这里和 RunDFlashLinear 用同一套逐行 2 的幂缩放。
+            scaled = FastllmCudaDFlashScaleToHalf(
+                input, halfInput, Qwen35DFlashScaleHeadroom());
+            if (!scaled) {
+                halfInput.CopyFrom(input);
+                qwen3cuda::Qwen3CudaToDataType(runner, halfInput, DataType::FLOAT16);
+            }
             source = &halfInput;
         }
         const bool trimPadding = compact && head->dims[0] != (int)selected->second.size();
@@ -29765,6 +30375,21 @@ namespace fastllm {
             qwen3cuda::Qwen3CudaSplit(runner, paddedOutput, -1, 0,
                 (int)selected->second.size(), output);
         }
+        if (scaled) {
+            // 还原成 input 的宽类型（BF16）。logits 真值 ~1e13，FP16 装不下，
+            // 只有 BF16 的指数范围放得下；调用方随后会转成 FP32 再送 top-k。
+            FastllmCudaDFlashScaleBack(output, input);
+        }
+        if (Qwen35DFlashDiagEnabled()) {
+            printf("[DFlashLmHead] dev=%d scaled=%d headType=%d inType=%d "
+                   "outType=%d inDims=%d rows=%d vocab=%d\n",
+                   device, (int)scaled, (int)head->dataType, (int)input.dataType,
+                   (int)output.dataType,
+                   input.dims.empty() ? -1 : (int)input.dims.back(),
+                   output.dims.empty() ? -1 : (int)output.dims[0],
+                   output.dims.empty() ? -1 : (int)output.dims.back());
+            fflush(stdout);
+        }
 #else
         (void)device;
         (void)useShortlist;
@@ -29772,8 +30397,19 @@ namespace fastllm {
 #endif
     }
 
-    void Qwen3_5Model::RunDFlashGateupLinear(
-            int device, Data &input, Data &linearWeight, Data &output) {
+    // DFlash2 的 TP GEMM 统一入口：权重是 TP 分片时必须走多卡 executor。
+    // 全局 Linear 只认单卡权重——它拿到分片权重会在空 shard 上 ToDevice 崩掉
+    // （实测 "ToDevice Error: no CPU data to copy to CUDA"），而
+    // mlp.gateup_proj/mlp.down_proj 恰恰是这个草稿里仅有的两个分片权重。
+    //   * forceOutputGather=true  —— 行并行（gateup）：每卡算完整输出行，按行
+    //     收集即可，不需要 reduce。
+    //   * forceOutputGather=false —— 列并行（down_proj）：每卡只持有 K 的一段，
+    //     必须走 RunMultiCudaColumnLinear 把各分片的偏和 allreduce 起来。
+    // 缩放保护与 RunDFlashLinear 完全一致：分片 GEMM 同样是 FP16 出口，同样要
+    // 按行压输入、出来再乘回，否则深层 gateup 输出一样会溢成 inf。
+    void Qwen3_5Model::RunDFlashTpLinear(
+            int device, Data &input, Data &linearWeight, Data &bias,
+            Data &output, bool forceOutputGather, Data *halfInputScratch) {
 #ifdef USE_CUDA
         if (dflashTpBackbonePrepared &&
             dflashTpPreparedDevices.size() > 1 &&
@@ -29782,27 +30418,47 @@ namespace fastllm {
                 linearWeight, dflashTpPreparedDevices)) {
             Executor &tpExecutor = Qwen35DFlashTpExecutor(
                 dflashTpPreparedDevices, dflashTpPreparedRatios);
-            Data halfInput;
+            Data temporaryHalfInput;
+            Data &halfInput = halfInputScratch ? *halfInputScratch : temporaryHalfInput;
             Data *source = &input;
+            bool scaled = false;
             if (linearWeight.dataType == DataType::NVFP4_BLOCK_16 && input.dataType != DataType::FLOAT16) {
-                ToDataType(input, halfInput, DataType::FLOAT16);
+                const bool canScale = input.dataType == DataType::BFLOAT16 ||
+                                      halfInputScratch != nullptr;
+                if (canScale) {
+                    scaled = FastllmCudaDFlashScaleToHalf(input, halfInput,
+                                                          Qwen35DFlashScaleHeadroom());
+                }
+                if (!scaled) {
+                    ToDataType(input, halfInput, DataType::FLOAT16);
+                }
                 source = &halfInput;
             }
             tpExecutor.Run(
                 "Linear",
                 {{"input", source},
                  {"weight", &linearWeight},
-                 {"bias", GetEmptyData()},
+                 {"bias", &bias},
                  {"output", &output}},
-                {}, {{"forceOutputGather", 1}});
+                {}, forceOutputGather ? IntDict{{"forceOutputGather", 1}} : IntDict{});
             FastllmCudaSetDevice(device);
-            ToDataType(output, input.dataType);
+            bool scaledBack = false;
+            scaledBack = scaled && FastllmCudaDFlashScaleBack(output, input);
+            if (!scaledBack) {
+                ToDataType(output, input.dataType);
+            }
             return;
         }
 #else
         (void)device;
+        (void)forceOutputGather;
 #endif
-        RunDFlashLinear(input, linearWeight, *GetEmptyData(), output);
+        RunDFlashLinear(input, linearWeight, bias, output, halfInputScratch);
+    }
+
+    void Qwen3_5Model::RunDFlashGateupLinear(
+            int device, Data &input, Data &linearWeight, Data &output) {
+        RunDFlashTpLinear(device, input, linearWeight, *GetEmptyData(), output, true);
     }
 
     struct Qwen35DFlashTpMlpWorkspace {
@@ -29903,6 +30559,132 @@ namespace fastllm {
 #endif
     }
 
+
+#ifdef USE_CUDA
+        // ── DFlash2 数值探针 ──────────────────────────────────────────────
+        // 只读：物化一份 FP32 拷贝到 host 统计 absmax 与超阈计数，不改动被探张量。
+        // 默认关闭；FASTLLM_DFLASH_PROBE=1 打开。CUDA Graph 捕获期自动跳过。
+        static bool Qwen35DFlashProbeEnabled() {
+            return Qwen35DFlashDiagEnabled();
+        }
+
+        static void Qwen35DFlashProbe(const char *tag, int layer, const Data &src) {
+            if (!Qwen35DFlashProbeEnabled() || src.dims.empty()) return;
+            if (FastllmCudaGraphIsCapturing()) return;
+            if (src.dataDevice != DataDevice::CUDA || src.cudaData == nullptr) return;
+            const long long count = src.Count(0);
+            if (count <= 0) return;
+            Data f32;
+            std::vector<float> host;
+            const float *v = nullptr;
+            try {
+                ToDataType(src, f32, DataType::FLOAT32);
+                if (f32.dataDevice == DataDevice::CUDA && f32.cudaData != nullptr) {
+                    host.resize((size_t) count);
+                    FastllmCudaCopyFromDeviceToHost(
+                        host.data(), f32.cudaData, (size_t) count * sizeof(float));
+                    v = host.data();
+                } else if (f32.cpuData != nullptr) {
+                    v = (const float *) f32.cpuData;
+                }
+            } catch (...) {
+                printf("[DFlash探针] L%d %-26s <读取异常>\n", layer, tag);
+                fflush(stdout);
+                return;
+            }
+            if (v == nullptr) return;
+            double amax = 0.0, sum = 0.0, sumsq = 0.0;
+            long long o65504 = 0, o1e5 = 0, o1e6 = 0, o1e7 = 0, nonfinite = 0;
+            std::vector<float> absValues;
+            absValues.reserve((size_t) count);
+            for (long long i = 0; i < count; i++) {
+                const float x = v[i];
+                if (!std::isfinite(x)) { nonfinite++; continue; }
+                const double a = std::fabs((double) x);
+                sum += x;
+                sumsq += (double) x * (double) x;
+                absValues.push_back((float) a);
+                if (a > amax) amax = a;
+                if (a > 65504.0)  o65504++;
+                if (a > 1.0e5)    o1e5++;
+                if (a > 1.0e6)    o1e6++;
+                if (a > 1.0e7)    o1e7++;
+            }
+            // 均值/标准差/分位数：用来判断激活是不是被"直流分量"主导 ——
+            // 若 |mean| 与 std 同量级、q50 接近 amax，则 GEMM 会顶到
+            // Σ|W_row|·max|x| 的上界（实测 o_proj/gateup 都越界），
+            // 正常激活应该是 q50 ≪ amax 的重尾分布。
+            const double finite = (double) std::max<long long>(1, count - nonfinite);
+            const double mean = sum / finite;
+            const double var = std::max(0.0, sumsq / finite - mean * mean);
+            const double sd = std::sqrt(var);
+            double q50 = 0.0, q99 = 0.0;
+            if (!absValues.empty()) {
+                const size_t k50 = (size_t) (absValues.size() * 0.50);
+                const size_t k99 = std::min(absValues.size() - 1,
+                                            (size_t) (absValues.size() * 0.99));
+                std::nth_element(absValues.begin(), absValues.begin() + k50, absValues.end());
+                q50 = absValues[k50];
+                std::nth_element(absValues.begin(), absValues.begin() + k99, absValues.end());
+                q99 = absValues[k99];
+            }
+            printf("[DFlash探针] L%d %-26s n=%-7lld amax=%-11.5g mean=%-11.5g std=%-11.5g q50=%-11.5g q99=%-11.5g |mean|/std=%-8.3g amax/std=%-8.4g >65504=%-6lld >1e5=%-6lld >1e6=%-6lld >1e7=%-5lld 非有限=%lld\n",
+                   layer, tag, count, amax, mean, sd, q50, q99,
+                   sd > 0.0 ? std::fabs(mean) / sd : 0.0,
+                   sd > 0.0 ? amax / sd : 0.0,
+                   o65504, o1e5, o1e6, o1e7, nonfinite);
+            fflush(stdout);
+
+            // 结构分析：极端值到底集中在少数"列"（输出通道 -> 权重行的锅），
+            // 还是集中在少数"行"（token -> 激活离群点的锅）。
+            if (std::getenv("FASTLLM_DFLASH_PROBE_STRUCT") != nullptr &&
+                (std::strstr(tag, "o_proj") != nullptr ||
+                 std::strstr(tag, "conv_res") != nullptr ||
+                 std::strstr(tag, "after_attn") != nullptr)) {
+                const int cols = src.dims.back() > 0 ? src.dims.back() : 1;
+                const long long rows = count / cols;
+                if (rows > 0 && cols > 0 && (long long) cols * rows == count) {
+                    std::vector<double> colMax((size_t) cols, 0.0);
+                    std::vector<char> rowBad((size_t) rows, 0);
+                    long long badCols = 0, badRows = 0, badVals = 0;
+                    double topA[8];
+                    long long topI[8];
+                    for (int k = 0; k < 8; k++) { topA[k] = -1.0; topI[k] = -1; }
+                    for (long long i = 0; i < count; i++) {
+                        const float x = v[i];
+                        if (!std::isfinite(x)) continue;
+                        const double a = std::fabs((double) x);
+                        const long long c = i % cols;
+                        if (a > colMax[(size_t) c]) colMax[(size_t) c] = a;
+                        if (a > 65504.0) {
+                            badVals++;
+                            const long long r = i / cols;
+                            if (!rowBad[(size_t) r]) { rowBad[(size_t) r] = 1; badRows++; }
+                        }
+                        if (a > topA[7]) {
+                            topA[7] = a; topI[7] = i;
+                            for (int k = 7; k > 0 && topA[k] > topA[k - 1]; k--) {
+                                double ta = topA[k]; topA[k] = topA[k - 1]; topA[k - 1] = ta;
+                                long long ti = topI[k]; topI[k] = topI[k - 1]; topI[k - 1] = ti;
+                            }
+                        }
+                    }
+                    for (int c = 0; c < cols; c++) {
+                        if (colMax[(size_t) c] > 65504.0) badCols++;
+                    }
+                    printf("[DFlash结构] L%d %-24s 越界值=%-5lld 涉及行=%lld/%lld 涉及列=%lld/%d\n",
+                           layer, tag, badVals, badRows, rows, badCols, cols);
+                    printf("[DFlash结构]       top8 (行,列)=值:");
+                    for (int k = 0; k < 8 && topI[k] >= 0; k++) {
+                        printf(" (%lld,%lld)=%.4g", topI[k] / cols, topI[k] % cols, topA[k]);
+                    }
+                    printf("\n");
+                    fflush(stdout);
+                }
+            }
+        }
+#endif
+
     void Qwen3_5Model::AppendDFlashTargetHidden(
             int device, int tokens, DFlashContext &context) {
 #ifndef USE_CUDA
@@ -29986,6 +30768,7 @@ namespace fastllm {
                     captured.unitSizeDiv == 1 &&
                     captured.unitSize == (int)elementBytes,
                 "DFlash selected target hidden layout is invalid.\n");
+            Qwen35DFlashProbe("KV.target_hidden", feature, captured);
             if (batchCopies) {
                 for (int row = 0; row < tokens; ++row) {
                     copyDsts.push_back(static_cast<uint8_t*>(combined.cudaData) +
@@ -30011,13 +30794,26 @@ namespace fastllm {
             }
         }
         Data projected, projectedContextHidden;
-        RunDFlashLinear(combined, projectionWeight,
-               *GetEmptyData(), projected);
+        Qwen35DFlashProbe("KV.combined_in", -1, combined);
+        // TP 下 fc 按输出维行并行，各卡算 [tokens, 2560] 再由 gather 收成
+        // [tokens, 5120]。分片路径要求输出先分配好（executor 不会替空输出
+        // 分配，会拿它去 ToDevice）。
+        ::fastllm::Qwen3CudaPrepareLocalOutput(projected, device);
+        projected.dataType = projectionInputType;
+        projected.UpdateUnitSize();
+        projected.Resize(
+            {1, projectionTokens, (int)projectionWeight.dims[0]});
+        projected.Allocate(false);
+        // 行并行 + output gather（fc 无 bias，传空偏置）。
+        RunDFlashTpLinear(device, combined, projectionWeight,
+               *GetEmptyData(), projected, true);
+        Qwen35DFlashProbe("KV.fc_out", -1, projected);
         if (projected.dataType != DataType::BFLOAT16) {
             ToDataType(projected, DataType::BFLOAT16);
         }
         RMSNorm(projected, weight["dflash.hidden_norm.weight"],
                 dflashRmsNormEps, projectedContextHidden);
+        Qwen35DFlashProbe("KV.hidden_norm_out", -1, projectedContextHidden);
 
         const int startPosition = context.committedTokens;
         AssertInFastLLM(startPosition >= 0 && tokens <= max_positions - startPosition,
@@ -30047,6 +30843,7 @@ namespace fastllm {
                 "DFlash fused KV projection weight shape is invalid.\n");
             RunDFlashLinear(projectedContextHidden, allKvWeightIt->second,
                    *GetEmptyData(), projectedAllKv);
+            Qwen35DFlashProbe("KV.all_kv_out", -1, projectedAllKv);
         }
         auto allKNormIt = weight.weight.find("dflash.all_k_norm.weight");
         const bool canFuseKvMaterialization =
@@ -30165,12 +30962,28 @@ namespace fastllm {
                     Split(projectedKv, -1, kvRows, 2 * kvRows,
                           projectedValue);
                 } else {
-                    Linear(projectedContextHidden,
-                           weight[prefix + "self_attn.k_proj.weight"],
-                           *GetEmptyData(), projectedKey);
-                    Linear(projectedContextHidden,
-                           weight[prefix + "self_attn.v_proj.weight"],
-                           *GetEmptyData(), projectedValue);
+                    // TP 下 k/v 已按输出行分片，必须走多卡 executor：全局
+                    // Linear 拿到分片权重会去 stage 源已释放的父权重视图，
+                    // 直接崩在 ToDevice Error: no CPU data to copy to CUDA
+                    // （backtrace 实测）。输出按融合分支的写法先分配好。
+                    for (auto item : {
+                             std::make_pair(&projectedKey, kvRows),
+                             std::make_pair(&projectedValue, kvRows)}) {
+                        ::fastllm::Qwen3CudaPrepareLocalOutput(
+                            *item.first, device);
+                        item.first->dataType = DataType::FLOAT16;
+                        item.first->UpdateUnitSize();
+                        item.first->Resize({projectionTokens, item.second});
+                        item.first->Allocate(false);
+                    }
+                    RunDFlashTpLinear(
+                        device, projectedContextHidden,
+                        weight[prefix + "self_attn.k_proj.weight"],
+                        *GetEmptyData(), projectedKey, true);
+                    RunDFlashTpLinear(
+                        device, projectedContextHidden,
+                        weight[prefix + "self_attn.v_proj.weight"],
+                        *GetEmptyData(), projectedValue, true);
                 }
                 if (projectionTokens == tokens) {
                     Copy(projectedKey, key);
@@ -30403,6 +31216,15 @@ namespace fastllm {
         int previousToken = anchorToken;
         std::vector<float> predecessorHidden(dflashSelectorRank);
         std::vector<float> scoreProducts(dflashSelectorRank);
+        if (Qwen35DFlashDiagEnabled()) {
+            printf("[DFlash selector] topK raw:");
+            for (int i = 0; i < 8 && i < dflashSelectorTopK; ++i) {
+                printf(" (%.6g,%.6g)", candidateTopK[i * 2],
+                       candidateTopK[i * 2 + 1]);
+            }
+            printf("\n");
+            fflush(stdout);
+        }
         for (int position = 0; position < slots; ++position) {
             AssertInFastLLM(
                 previousToken >= 0 && previousToken < predecessor.dims[0],
@@ -30420,6 +31242,14 @@ namespace fastllm {
                     ((size_t)position * dflashSelectorTopK + candidate) * 2;
                 const int candidateToken =
                     (int)(candidateTopK[topKOffset] + 1.0e-3f);
+                if (candidateToken < 0 || candidateToken >= successor.dims[0]) {
+                    printf("[DFlash selector] 越界候选 pos=%d cand=%d id=%d raw=%.6g "
+                           "vocab=%d topK=%d\n",
+                           position, candidate, candidateToken,
+                           candidateTopK[topKOffset], successor.dims[0],
+                           dflashSelectorTopK);
+                    fflush(stdout);
+                }
                 AssertInFastLLM(
                     candidateToken >= 0 && candidateToken < successor.dims[0],
                     "DFlash selector candidate id is out of range.\n");
@@ -30507,6 +31337,7 @@ namespace fastllm {
             localRows > 0 && firstRow >= 0 && outputRows > 0 &&
                 firstRow + outputRows <= localRows && topK > 0,
             "DFlash CUDA top-k got an invalid row range.\n");
+        Qwen35DFlashProbe("selector.logits", -1, logits);
 
         Data packedCandidates, scratch;
         Qwen3CudaPrepareLocalOutput(packedCandidates, device);
@@ -30618,6 +31449,11 @@ namespace fastllm {
             Data gate, up, gateup;
             Data halfAttentionDynamic, halfQkv, halfOutput;
             Data halfMlpDynamic, halfGateup, halfDown;
+            // FP32 残差路径的临时缓冲（见 RunDFlashDraft 里残差改 FP32 的说明）：
+            //   normalizedWide —— RMSNorm 的 FP32 输出，再 cast 回 BF16 喂 GEMM/conv
+            //   convWide       —— conv 的 BF16 输出扩成 FP32，才能与 FP32 残差相加
+            //                     （AddTo 要求两侧 dtype 完全一致）
+            Data normalizedWide, convWide;
             Qwen35DFlashTpMlpWorkspace tpMlp;
             Graph prefix, tail, mlpTail;
         };
@@ -30795,6 +31631,15 @@ namespace fastllm {
         } else if (hiddenStates.dataType != DataType::BFLOAT16) {
             ToDataType(hiddenStates, DataType::BFLOAT16);
         }
+        Qwen35DFlashProbe("res.entry", -1, hiddenStates);
+        // ── 残差改为 FP32 累加（参考实现 vllm_dflash2 的同款修法）──────────
+        // 这个草稿的残差涨到 ~6e11：BF16 在 7e10 处的 ulp≈2.8e8，而每层注意力
+        // 的贡献只有 1e6~1e7，BF16 累加会把它们整段舍掉。实测 L1/L2/L3 的
+        // res.after_attn 与上一层 res.after_mlp 五位有效数字完全相同（L1 注意力
+        // 贡献 2.36e6、相对量 3.3e-5，被彻底吞掉），接受率因此只有 11.7%/1.0%。
+        // FP32 的 7 位有效数字保得住这些贡献。GEMM 入口仍走原有的逐行 2 的幂
+        // 缩放裁到 FP16，溢出保护不变。
+        ToDataType(hiddenStates, DataType::FLOAT32);
 
         if (compute && compute->hiddenPointer != hiddenStates.cudaData) {
             for (auto &layer : compute->layers) {
@@ -30894,19 +31739,26 @@ namespace fastllm {
             std::optional<Qwen35DFlashComputeWorkspace::Layer> eagerLayer;
             auto &buffers = compute ? compute->layers[layerIndex] : eagerLayer.emplace();
             Data &normalized = buffers.normalized, &attentionDynamic = buffers.attentionDynamic;
+            Data &normalizedWide = buffers.normalizedWide, &convWide = buffers.convWide;
             Data &attentionInput = buffers.attentionInput;
             Data &query = buffers.query, &key = buffers.key, &value = buffers.value, &mergedQkv = buffers.mergedQkv;
             auto runPrefix = [&]() {
+                // RMSNorm 在 FP32 残差上算（BF16/FP16 下 mean(x²) 会先溢出），
+                // 结果再裁回 BF16 喂 GEMM 与融合 conv —— 与参考实现一致。
                 RMSNorm(hiddenStates, weight[prefix + "input_layernorm.weight"],
-                        dflashRmsNormEps, normalized);
+                        dflashRmsNormEps, normalizedWide);
+                ToDataType(normalizedWide, normalized, DataType::BFLOAT16);
                 RunDFlashLinear(normalized,
                        weight[prefix +
                               "attention_conv.kernel_projection.weight"],
                        *GetEmptyData(), attentionDynamic, compute ? &buffers.halfAttentionDynamic : nullptr);
+                Qwen35DFlashProbe("attn.in_norm", layerIndex, normalized);
+                Qwen35DFlashProbe("attn.conv_proj", layerIndex, attentionDynamic);
                 dynamicConvolve(
                     normalized, attentionDynamic,
                     weight[prefix + "attention_conv.base_kernel"], 0,
                     attentionInput);
+                Qwen35DFlashProbe("attn.conv_out", layerIndex, attentionInput);
 
                 bool fusedQkvPrepared = false;
                 auto mergedQkvIt = weight.weight.find(
@@ -30916,6 +31768,7 @@ namespace fastllm {
                     const int kvChannels = dflashKvHeads * dflashHeadDim;
                     RunDFlashLinear(attentionInput, mergedQkvIt->second,
                            *GetEmptyData(), mergedQkv, compute ? &buffers.halfQkv : nullptr);
+                    Qwen35DFlashProbe("attn.mergeqkv", layerIndex, mergedQkv);
                     for (auto item : {
                              std::make_pair(&query, dflashHeads),
                              std::make_pair(&key, dflashKvHeads),
@@ -30950,15 +31803,37 @@ namespace fastllm {
                               qChannels + 2 * kvChannels, value);
                     }
                 } else {
-                    Linear(attentionInput,
-                           weight[prefix + "self_attn.q_proj.weight"],
-                           *GetEmptyData(), query);
-                    Linear(attentionInput,
-                           weight[prefix + "self_attn.k_proj.weight"],
-                           *GetEmptyData(), key);
-                    Linear(attentionInput,
-                           weight[prefix + "self_attn.v_proj.weight"],
-                           *GetEmptyData(), value);
+                    // TP 下 q/k/v 已按输出行分片（见
+                    // Qwen35DFlashTpLinearEligible）。分片路径要求输出已在
+                    // root 卡上分配好：executor 会把每卡的分片结果按行收集
+                    // 回来，而空输出会被它拿去 ToDevice stage 到各卡，报
+                    // "ToDevice Error: no CPU data to copy to CUDA"。单设备
+                    // 的全局 Linear 会自己分配输出，所以只有分片时才需要
+                    // 这一步（融合分支同样先 PrepareLocalOutput + Allocate）。
+                    for (auto item : {
+                             std::make_pair(&query, dflashHeads),
+                             std::make_pair(&key, dflashKvHeads),
+                             std::make_pair(&value, dflashKvHeads)}) {
+                        ::fastllm::Qwen3CudaPrepareLocalOutput(
+                            *item.first, device);
+                        item.first->dataType = DataType::FLOAT16;
+                        item.first->UpdateUnitSize();
+                        item.first->Resize(
+                            {blockSize, item.second * dflashHeadDim});
+                        item.first->Allocate(false);
+                    }
+                    RunDFlashTpLinear(
+                        device, attentionInput,
+                        weight[prefix + "self_attn.q_proj.weight"],
+                        *GetEmptyData(), query, true);
+                    RunDFlashTpLinear(
+                        device, attentionInput,
+                        weight[prefix + "self_attn.k_proj.weight"],
+                        *GetEmptyData(), key, true);
+                    RunDFlashTpLinear(
+                        device, attentionInput,
+                        weight[prefix + "self_attn.v_proj.weight"],
+                        *GetEmptyData(), value, true);
                 }
                 if (!fusedQkvPrepared) {
                     query.Reshape(
@@ -31076,25 +31951,40 @@ namespace fastllm {
                        *GetEmptyData(), attentionOutput, compute ? &buffers.halfOutput : nullptr);
                 dynamicConvolve(attentionOutput, attentionDynamic,
                     weight[prefix + "attention_conv.base_kernel"], 1, buffers.convolvedAttention);
-                AddTo(hiddenStates, buffers.convolvedAttention);
+                ToDataType(buffers.convolvedAttention, convWide, DataType::FLOAT32);
+                AddTo(hiddenStates, convWide);
+                Qwen35DFlashProbe("attn.o_proj", layerIndex, attentionOutput);
+                Qwen35DFlashProbe("attn.conv_res", layerIndex, buffers.convolvedAttention);
+                Qwen35DFlashProbe("res.after_attn", layerIndex, hiddenStates);
 
                 RMSNorm(hiddenStates,
                         weight[prefix + "post_attention_layernorm.weight"],
-                        dflashRmsNormEps, normalized);
+                        dflashRmsNormEps, normalizedWide);
+                ToDataType(normalizedWide, normalized, DataType::BFLOAT16);
                 RunDFlashLinear(normalized,
                        weight[prefix + "mlp_conv.kernel_projection.weight"],
                        *GetEmptyData(), mlpDynamic, compute ? &buffers.halfMlpDynamic : nullptr);
+                Qwen35DFlashProbe("mlp.in_norm", layerIndex, normalized);
+                Qwen35DFlashProbe("mlp.conv_proj", layerIndex, mlpDynamic);
                 dynamicConvolve(
                     normalized, mlpDynamic,
                     weight[prefix + "mlp_conv.base_kernel"], 0,
                     mlpInput);
+                Qwen35DFlashProbe("mlp.conv_out", layerIndex, mlpInput);
             };
             auto runMlp = [&]() {
                 auto gateupIt = weight.weight.find(
                     prefix + "mlp.gateup_proj.weight");
                 auto downIt = weight.weight.find(
                     prefix + "mlp.down_proj.weight");
+                // FASTLLM_DFLASH_DISABLE_TP_MLP=1 时跳过融合 TP MLP, 走单独
+                // gateup+silu+down_proj 分路 —— 每条分路都经过 RunDFlashLinear 的
+                // 逐行缩放, 用于定位/对照 TP 融合路径的 fp16 溢出。
+                static const bool dflashTpMlpDisabled =
+                    std::getenv("FASTLLM_DFLASH_DISABLE_TP_MLP") != nullptr &&
+                    std::strcmp(std::getenv("FASTLLM_DFLASH_DISABLE_TP_MLP"), "0") != 0;
                 bool pairedTpMlp =
+                    !dflashTpMlpDisabled &&
                     gateupIt != weight.weight.end() &&
                     downIt != weight.weight.end() &&
                     RunDFlashTensorParallelMlp(
@@ -31138,22 +32028,29 @@ namespace fastllm {
                             weight[prefix + "mlp.up_proj.weight"],
                             *GetEmptyData(), up);
                     }
+                    Qwen35DFlashProbe("mlp.gateup", layerIndex, gateup);
                     if (!fusedGateupPrepared) {
                         computeCompatible = false;
-                        ToDataType(gate, DataType::FLOAT16);
-                        ToDataType(up, DataType::FLOAT16);
+                        // silu 和乘都在 BF16 里做：gate/up 各自 O(1e3) 没问题，
+                        // 但乘积可达 ~1e7，先降到 FP16 再乘就直接是 inf
+                        // （实测 L0 mlp.silu_out 非有限=6703）。
+                        // CUDA 的 Silu/MulTo 都支持 BF16，不需要这一趟降位。
                         Silu(gate, gate);
                         MulTo(gate, up);
-                        ToDataType(gate, DataType::BFLOAT16);
                     }
+                    Qwen35DFlashProbe("mlp.silu_out", layerIndex, gate);
                     RunDFlashLinear(gate, weight[prefix + "mlp.down_proj.weight"],
                            *GetEmptyData(), mlpOutput, compute ? &buffers.halfDown : nullptr);
+                    Qwen35DFlashProbe("mlp.down_proj", layerIndex, mlpOutput);
                 }
             };
             auto runMlpTail = [&]() {
                 dynamicConvolve(mlpOutput, mlpDynamic,
                     weight[prefix + "mlp_conv.base_kernel"], 1, buffers.convolvedMlp);
-                AddTo(hiddenStates, buffers.convolvedMlp);
+                ToDataType(buffers.convolvedMlp, convWide, DataType::FLOAT32);
+                AddTo(hiddenStates, convWide);
+                Qwen35DFlashProbe("mlp.conv_res", layerIndex, buffers.convolvedMlp);
+                Qwen35DFlashProbe("res.after_mlp", layerIndex, hiddenStates);
             };
             if (compute && compute->tpBackbone) {
                 buffers.tail.Run(runTail, useComputeGraphs);
@@ -31184,8 +32081,10 @@ namespace fastllm {
             compute->logged = true;
         }
 
+        Qwen35DFlashProbe("res.final_raw", dflashLayers, hiddenStates);
         RMSNorm(hiddenStates, weight["dflash.norm.weight"],
                 dflashRmsNormEps, hiddenStates);
+        Qwen35DFlashProbe("res.final_norm", dflashLayers, hiddenStates);
         Data slotHidden;
         Split(hiddenStates, 1, 1, runtimeBlockSize, slotHidden);
 
@@ -31320,7 +32219,7 @@ namespace fastllm {
                                   *biasIt->second, localLogits, useShortlist);
                     qwen3cuda::Qwen3CudaToDataType(
                         runner, localLogits, DataType::FLOAT32);
-
+                    Qwen35DFlashProbe("lmHead.fast", rank, localLogits);
                     ::fastllm::Qwen3CudaPrepareLocalOutput(
                         localPacked[rank], localDevice);
                     localPacked[rank].dataType = DataType::INT32;
@@ -31444,6 +32343,7 @@ namespace fastllm {
                                   *biasIt->second, localLogits, useShortlist);
                 qwen3cuda::Qwen3CudaToDataType(
                     runner, localLogits, DataType::FLOAT32);
+                Qwen35DFlashProbe("lmHead.slow", rank, localLogits);
                 qwen3cuda::Qwen3CudaTopK(
                     runner, localLogits, localTopKs[rank],
                     dflashSelectorTopK);
@@ -31762,15 +32662,27 @@ namespace fastllm {
                           qChannels + 2 * kvChannels, value);
                 }
             } else {
-                Linear(attentionInput,
-                       weight[prefix + "self_attn.q_proj.weight"],
-                       *GetEmptyData(), query);
-                Linear(attentionInput,
-                       weight[prefix + "self_attn.k_proj.weight"],
-                       *GetEmptyData(), key);
-                Linear(attentionInput,
-                       weight[prefix + "self_attn.v_proj.weight"],
-                       *GetEmptyData(), value);
+                // 与单请求路径一致：分片路径要求输出先分配好，见上面的说明。
+                for (auto item : {
+                         std::make_pair(&query, dflashHeads),
+                         std::make_pair(&key, dflashKvHeads),
+                         std::make_pair(&value, dflashKvHeads)}) {
+                    ::fastllm::Qwen3CudaPrepareLocalOutput(*item.first, device);
+                    item.first->dataType = DataType::FLOAT16;
+                    item.first->UpdateUnitSize();
+                    item.first->Resize(
+                        {totalTokens, item.second * dflashHeadDim});
+                    item.first->Allocate(false);
+                }
+                RunDFlashTpLinear(device, attentionInput,
+                                  weight[prefix + "self_attn.q_proj.weight"],
+                                  *GetEmptyData(), query, true);
+                RunDFlashTpLinear(device, attentionInput,
+                                  weight[prefix + "self_attn.k_proj.weight"],
+                                  *GetEmptyData(), key, true);
+                RunDFlashTpLinear(device, attentionInput,
+                                  weight[prefix + "self_attn.v_proj.weight"],
+                                  *GetEmptyData(), value, true);
             }
             if (!fusedQkvPrepared) {
                 query.Reshape(
@@ -31946,11 +32858,10 @@ namespace fastllm {
                         *GetEmptyData(), up);
                 }
                 if (!fusedGateupPrepared) {
-                    ToDataType(gate, DataType::FLOAT16);
-                    ToDataType(up, DataType::FLOAT16);
+                    // 与 graph 路径同理：gate/up 各自 O(1e3) 没问题，乘积 ~1e7
+                    // 一旦走 FP16 就是 inf，必须在 BF16（或更宽）里乘。
                     Silu(gate, gate);
                     MulTo(gate, up);
-                    ToDataType(gate, DataType::BFLOAT16);
                 }
                 RunDFlashLinear(gate,
                        weight[prefix + "mlp.down_proj.weight"],
@@ -35566,12 +36477,46 @@ namespace fastllm {
             }
             chunkSize = std::max(1, std::min(chunkSize, totalLen));
 
+            // 视觉块之后第一个页对齐位置: 让分块边界正好落在这里.
+            // 页对齐是记录前缀快照的硬要求 (线性注意力状态与分页 KV 都要
+            // 对齐到同一长度), 而带图 prompt 的 token 总数几乎不会落在页边界.
+            // 图后若没有这样的边界, 后续每一轮增量对话都只能整段重算 (32K
+            // 上下文每轮 30s+). 有了这一刀, 图后立刻能记录一份可复用快照.
+            int visionAlignedBoundary = -1;
+            {
+                const int pageLen = std::max(1, fastllm::GetPageLen());
+                int visionEnd = -1;
+                for (int i = totalLen - 1; i >= 0; i--) {
+                    const int tokenId = (int)inputPtr[i];
+                    if ((this->image_token_id >= 0 &&
+                         tokenId == this->image_token_id) ||
+                        (this->video_token_id >= 0 &&
+                         tokenId == this->video_token_id)) {
+                        visionEnd = i + 1;
+                        break;
+                    }
+                }
+                if (visionEnd > 0 && visionEnd < totalLen) {
+                    const int aligned =
+                        ((visionEnd + pageLen - 1) / pageLen) * pageLen;
+                    if (aligned > 0 && aligned < totalLen) {
+                        visionAlignedBoundary = aligned;
+                    }
+                }
+            }
+
             std::vector<int> chunkRet;
             std::vector<int> dflashDrafts;
             int firstMtpDraft = -1;
+            int chunkCurLen = 0;
             try {
-                for (int st = 0; st < totalLen; st += chunkSize) {
-                    const int curLen = std::min(chunkSize, totalLen - st);
+                for (int st = 0; st < totalLen; st += chunkCurLen) {
+                    int curLen = std::min(chunkSize, totalLen - st);
+                    if (visionAlignedBoundary > st &&
+                        st + curLen > visionAlignedBoundary) {
+                        curLen = visionAlignedBoundary - st;
+                    }
+                    chunkCurLen = curLen;
                     const bool isLastChunk = st + curLen == totalLen;
                     Data curInputIds, curPositionIds, curHiddenStates;
                     Split(inputIds, 1, st, st + curLen, curInputIds);
@@ -35671,6 +36616,29 @@ namespace fastllm {
                         if (!appended) {
                             seedDFlash = false;
                         }
+                    }
+                    // 多模态 prefill 的分块边界: 此处已推进的 token 数恰好是
+                    // chunked_prefill_size 的整数倍 (页对齐), 且线性注意力层状态
+                    // 与 MTP draft 缓存都同步到同一长度 —— 这是带图请求唯一能安全
+                    // 记录前缀快照的时机. 带图 prompt 的 token 总数 (文本 + 视觉)
+                    // 几乎不会落在页边界上, 因此不能在 forward 结束后再记录.
+                    // context 由模型内部调度路径直接传入; 走 basellm 通用路径时
+                    // 该参数为 nullptr, 由 thread_local 兜底.
+                    ResponseContext *recordContext = context;
+                    if (recordContext == nullptr) {
+                        recordContext =
+                            (ResponseContext*)fastllm::gQwen35MultimodalRecordContext;
+                    }
+                    if (recordContext != nullptr) {
+                        // 视觉块边界那一刀即使离上一个快照很近, 也必须记录:
+                        // 它是图后唯一能让后续增量轮次复用的长前缀.
+                        recordContext->intParams[
+                            "qwen35_force_prefix_snapshot"] =
+                            (st + curLen == visionAlignedBoundary &&
+                             visionAlignedBoundary > 0) ? 1 : 0;
+                        recordContext->TryRecordPagedCache(this);
+                        recordContext->intParams[
+                            "qwen35_force_prefix_snapshot"] = 0;
                     }
                 }
             } catch (...) {

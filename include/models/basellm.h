@@ -469,6 +469,8 @@ namespace fastllm {
         virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context);
         virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const;
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const;
+        // 模型是否支持带图请求的前缀缓存复用 (需要能按图片内容键比对快照).
+        virtual bool SupportsMediaKeyedPrefixCache() const { return false; }
 
         virtual void PrepareToolCallConstraint(ResponseContext *context, GenerationConfig &generationConfig);
 

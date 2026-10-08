@@ -5,11 +5,18 @@
 #include "basellm.h"
 #include "utils.h"
 #include "utils/cuda_cache_budget.h"
+#include "utils/qwen35_mm_record_hook.h"
 #include <sstream>
 #include <cstring>
 #include <cstdlib>
 #include <climits>
 #include <algorithm>
+
+namespace fastllm {
+    // 多模态 forward 期间当前请求的 ResponseContext（见
+    // utils/qwen35_mm_record_hook.h）。仅本线程可见。
+    thread_local void *gQwen35MultimodalRecordContext = nullptr;
+}
 #include <chrono>
 #include <exception>
 #include <set>
@@ -603,7 +610,11 @@ namespace fastllm {
 
     void ResponseContext::TryRecordPagedCache(basellm *model) {
         if (model->kvMemConfig.enabled) return;
-        if (!this->multimodalInput.empty()) {
+        // 带图请求默认不记录前缀快照: 快照只按 token 匹配, 而图像占位 token
+        // 对不同图片是同一串 id, 直接复用会串图. 支持按图片内容键比对的模型
+        // (Qwen3.5) 由模型侧保证安全, 因此允许其参与前缀缓存.
+        if (!this->multimodalInput.empty() &&
+            (model == nullptr || !model->SupportsMediaKeyedPrefixCache())) {
             return;
         }
         bool hasLinearAttentionCache = false;
@@ -677,6 +688,7 @@ namespace fastllm {
             reusablePrefixLen = 0;
         }
 
+        int recordedChains = 0;
         std::function<void(Data&)> recordPagedCache = [&](Data &cache) {
             if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
                 bool recordedLocal = false;
@@ -693,6 +705,7 @@ namespace fastllm {
             if (cache.pagedKVCacheData != nullptr && !cache.pageIndex.empty() &&
                 cache.pagedKVCacheData->type == PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
                 cache.pagedKVCacheData->Record(this->allTokens, cache.pageIndex);
+                recordedChains++;
             }
         };
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -706,6 +719,14 @@ namespace fastllm {
             }
             recordPagedCache(kvFirst);
             recordPagedCache(kvSecond);
+        }
+        if (getenv("FASTLLM_PREFIX_CACHE_DEBUG") != nullptr &&
+            !this->multimodalInput.empty()) {
+            fprintf(stderr, "[PCDBG-B] record mm=1 allTokens=%d reusablePrefix=%d "
+                            "chains=%d extra=%d\n",
+                    (int)this->allTokens.size(), reusablePrefixLen,
+                    recordedChains, (int)recordedPrefixExtra);
+            fflush(stderr);
         }
     }
 
@@ -1917,9 +1938,27 @@ namespace fastllm {
                     }
 
                     if (isPrompt) {
-                        if (!model->kvMemConfig.enabled && !isMultimodal && ctx->cacheLen == 0 &&
+                        // 带图请求默认不参与页探针/前缀恢复: 池里的页只按 token id
+                        // 命中, 而占位 token 对不同图片是同一串 id. 支持图片内容键
+                        // 的模型 (Qwen3.5) 由 QueryPagedPrefixCacheExtra 做键比对,
+                        // 图片不一致时返回 0, 整段恢复自动跳过, 因此可以放行.
+                        const bool mediaKeyedPrefixCache =
+                            model != nullptr && model->SupportsMediaKeyedPrefixCache();
+                        const bool probeAllowed =
+                            !model->kvMemConfig.enabled &&
+                            (!isMultimodal || mediaKeyedPrefixCache) && ctx->cacheLen == 0 &&
                             ctx->intParams.find("paged_prefix_restore_disabled") ==
-                                ctx->intParams.end()) {
+                                ctx->intParams.end();
+                        if (getenv("FASTLLM_PREFIX_CACHE_DEBUG") != nullptr) {
+                            fprintf(stderr, "[PCDBG-B] sched prompt=%d mm=%d cacheLen=%d cur=%d "
+                                            "kvMem=%d mediaKeyed=%d probeAllowed=%d\n",
+                                    (int)isPrompt, (int)isMultimodal, ctx->cacheLen,
+                                    (int)ctx->currentTokens.size(),
+                                    (int)model->kvMemConfig.enabled,
+                                    (int)mediaKeyedPrefixCache, (int)probeAllowed);
+                            fflush(stderr);
+                        }
+                        if (probeAllowed) {
                             PagedCacheManager *probeManager = nullptr;
                             bool queryUnboundedLayersOnly = false;
                             for (int li = 0; li < model->block_cnt && probeManager == nullptr; li++) {
@@ -1958,6 +1997,13 @@ namespace fastllm {
                                 };
 
                                 int minCachedPages = (int)queryManager(probeManager).size();
+                                if (getenv("FASTLLM_PREFIX_CACHE_DEBUG") != nullptr) {
+                                    fprintf(stderr, "[PCDBG-B] probe manager=%p mm=%d cur=%d "
+                                                    "minCachedPages=%d\n",
+                                            (void*)probeManager, (int)isMultimodal,
+                                            (int)ctx->currentTokens.size(), minCachedPages);
+                                    fflush(stderr);
+                                }
                                 if (minCachedPages > 0) {
                                     for (int li = 0; li < model->block_cnt; li++) {
                                         if (queryUnboundedLayersOnly &&
@@ -2514,6 +2560,7 @@ namespace fastllm {
                     ClearProfiler();
                 }
                 if (isSingleMultimodal) {
+                    fastllm::Qwen35MultimodalRecordScope mmRecordScope(singleContext);
                     ret = model->ForwardMultimodal(
                         inputIds,
                         attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
@@ -3170,6 +3217,7 @@ namespace fastllm {
                                 } else {
                                     auto context = model->responseContextDict.dicts.begin()->second;
                                     if (context->multimodalInput.size() > 0) {
+                                        fastllm::Qwen35MultimodalRecordScope mmRecordScope(context);
                                         ret = model->ForwardMultimodal(inputIds,
                                                             attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
                                                             *positionIds[0], *pastKeyValue1, context->multimodalInput,
@@ -5116,11 +5164,8 @@ namespace fastllm {
                             continue;
                         }
 
-                        long long finalSafety = std::max(
-                            128LL * 1024LL * 1024LL,
-                            totalBeforeRuntime[id] / 200);
-                        finalSafety = std::min(
-                            finalSafety, 512LL * 1024LL * 1024LL);
+                        long long finalSafety =
+                            fastllm::CudaCacheFinalSafety(totalBeforeRuntime[id]);
                         long long targetFree =
                             (long long)(totalBeforeRuntime[id] *
                                         (1.0 - fastllm::GetGpuMemRatio())) +
@@ -5217,8 +5262,7 @@ namespace fastllm {
                         }
 
                         long long finalSafety =
-                            std::max(128LL * 1024LL * 1024LL, totalAfterWarmup[id] / 200);
-                        finalSafety = std::min(finalSafety, 512LL * 1024LL * 1024LL);
+                            fastllm::CudaCacheFinalSafety(totalAfterWarmup[id]);
                         long long targetFree =
                             (long long)(totalAfterWarmup[id] * (1.0 - fastllm::GetGpuMemRatio())) +
                             finalSafety;
