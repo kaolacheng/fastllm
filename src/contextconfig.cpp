@@ -144,9 +144,14 @@ namespace fastllm {
         Require(r.type == "default" || r.type == "linear" || r.type == "yarn", "unsupported rope_type: " + r.type);
         const std::set<std::string> fields = {
             "rope_type", "rope_theta", "partial_rotary_factor", "factor",        "original_max_position_embeddings",
-            "beta_fast", "beta_slow",  "attention_factor",      "mrope_section", "mrope_interleaved"};
+            "beta_fast", "beta_slow",  "attention_factor",      "mrope_section", "mrope_interleaved",
+            "truncate"};
         for (auto &it : rope)
             Require(fields.count(it.first), "unsupported RoPE field: " + it.first);
+        auto trunc = rope.find("truncate");
+        if (trunc != rope.end())
+            Require(!trunc->second.is_bool() || !trunc->second.bool_value(),
+                    "rope_parameters.truncate=true is not implemented; serve with truncate=false");
         Require(r.IsYarn() || (!rope.count("beta_fast") && !rope.count("beta_slow") && !rope.count("attention_factor")),
                 "beta_fast, beta_slow and attention_factor require YaRN");
         Require(r.type != "default" || Number(rope, "factor", 1) == 1, "default RoPE cannot apply a scaling factor");
