@@ -3261,6 +3261,275 @@ __device__ __forceinline__ float FastllmCudaNVFP4ValueToFloat(__nv_bfloat16 valu
     return __bfloat162float(value);
 }
 
+// ── DFlash2 逐行激活缩放（方案 b）────────────────────────────────────────
+// 为什么需要：这台机器上唯一正确的 NVFP4 GEMM
+// (FastllmCudaTryNativeNvfp4Linear) 是 FP16 进 / FP16 出的，绕不开；而
+// DFlash2 草稿的 GEMM 输出峰值会超过 65504（实测 L0 attn.o_proj amax=59904
+// 且已有 inf），存成 half 就是 inf。inf 一旦进入后面的 RMSNorm 会立刻摊满
+// 整个张量，最终让 selector 选出越界候选 id 并中止进程。
+//
+// 为什么逐行而不是全局：实测越界值是稀疏离群点（L0 res.after_attn amax=8.23e5，
+// 但 40960 个元素里只有 17 个 >65504）。按张量最大值定一个全局 scale 会把 O(1)
+// 的主体一起压进 FP16 次正规区（下限 6.1e-5）变成 0，等于用缩放重演"固定阈值
+// 裁剪毁信息"。逐行缩放只让出现离群点的那一行承担大 scale，其余行按各自自然
+// 量级进入 FP16，精度完好。
+//
+// 原理：y = W·x 逐行独立，输入缩小 s_i 倍，GEMM 的 FP16 出口也自动缩小 s_i 倍，
+// 从而同时保护输入 cast 和输出存储。s_i 取 2 的幂 ⇒ FP32 下乘除精确，正常范围
+// 内不丢任何尾数。
+//
+// 全部新增，不修改任何既有内核。scale 全程留在设备上（不做主机 readback），
+// 因此不破坏 CUDA graph 捕获。
+//
+// 本函数只接受 FLOAT32 输入（调用方先把输入升到 FP32，既避免溢出也统一路径）。
+
+template <typename T>
+__device__ __forceinline__ T FastllmCudaDFlashFloatTo(float value);
+
+template <>
+__device__ __forceinline__ float FastllmCudaDFlashFloatTo<float>(float value) {
+    return value;
+}
+
+template <>
+__device__ __forceinline__ half FastllmCudaDFlashFloatTo<half>(float value) {
+    return __float2half_rn(value);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 FastllmCudaDFlashFloatTo<__nv_bfloat16>(float value) {
+    return __float2bfloat16_rn(value);
+}
+
+struct FastllmCudaDFlashRowScaleScratch {
+    float *rowMax;
+    float *scale;
+    float *invScale;
+    int capacity;
+};
+
+static FastllmCudaDFlashRowScaleScratch gFastllmCudaDFlashRowScaleScratch[64];
+
+// 取当前设备的 scratch，必要时按 rows 扩容。扩容只发生在首次/变大时，
+// 之后每步复用同一组缓冲，不会在 graph 捕获期间分配。
+static bool FastllmCudaDFlashEnsureRowScale(int rows) {
+    int device = FastllmCudaGetDevice();
+    if (device < 0 || device >= 64) {
+        device = 0;
+    }
+    FastllmCudaDFlashRowScaleScratch &b =
+        gFastllmCudaDFlashRowScaleScratch[device];
+    if (b.capacity >= rows && b.rowMax != nullptr) {
+        return true;
+    }
+    if (b.rowMax != nullptr) FastllmCudaFree(b.rowMax);
+    if (b.scale != nullptr) FastllmCudaFree(b.scale);
+    if (b.invScale != nullptr) FastllmCudaFree(b.invScale);
+    b.rowMax = nullptr;
+    b.scale = nullptr;
+    b.invScale = nullptr;
+    b.capacity = 0;
+    int cap = rows < 64 ? 64 : rows;
+    cap = (cap + 63) / 64 * 64;
+    b.rowMax = (float *) FastllmCudaMalloc((size_t)cap * sizeof(float));
+    b.scale = (float *) FastllmCudaMalloc((size_t)cap * sizeof(float));
+    b.invScale = (float *) FastllmCudaMalloc((size_t)cap * sizeof(float));
+    if (b.rowMax == nullptr || b.scale == nullptr || b.invScale == nullptr) {
+        if (b.rowMax != nullptr) FastllmCudaFree(b.rowMax);
+        if (b.scale != nullptr) FastllmCudaFree(b.scale);
+        if (b.invScale != nullptr) FastllmCudaFree(b.invScale);
+        b.rowMax = nullptr;
+        b.scale = nullptr;
+        b.invScale = nullptr;
+        return false;
+    }
+    b.capacity = cap;
+    return true;
+}
+
+template <typename T>
+__global__ void FastllmCudaDFlashAbsMaxPerRowKernel(
+        const T *x, int m, float *rowMax) {
+    __shared__ float sdata[256];
+    const int tid = threadIdx.x;
+    const T *p = x + (size_t)blockIdx.x * m;
+    float v = 0.0f;
+    for (int j = tid; j < m; j += blockDim.x) {
+        v = fmaxf(v, fabsf(FastllmCudaNVFP4ValueToFloat(p[j])));
+    }
+    sdata[tid] = v;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        rowMax[blockIdx.x] = sdata[0];
+    }
+}
+
+__global__ void FastllmCudaDFlashRowScaleKernel(
+        const float *rowMax, float *scale, float *invScale, int n,
+        float headroom) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float a = rowMax[i];
+        float s = 1.0f;
+        // 只在 a 有限且确实超headroom时才缩放。若上游已经漏进 inf/NaN，
+        // 这里必须原样放行（s=1）：否则 log2f(inf)=inf ⇒ s=inf ⇒ 0/0=NaN，
+        // 会把一个"已经坏了"的行变成"整行全 NaN"，掩盖真正的首故障点。
+        if (isfinite(a) && a > headroom) {
+            s = exp2f(ceilf(log2f(a / headroom)));
+            if (!isfinite(s) || s < 1.0f) {
+                s = 1.0f;
+            }
+        }
+        scale[i] = s;
+        invScale[i] = 1.0f / s;
+    }
+}
+
+template <typename T>
+__global__ void FastllmCudaDFlashScaleToHalfKernel(
+        const T *src, half *dst, const float *invScale, int m, int len) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < len) {
+        float v = FastllmCudaNVFP4ValueToFloat(src[i]) * invScale[i / m];
+        v = fminf(fmaxf(v, -60000.0f), 60000.0f);
+        dst[i] = __float2half_rn(v);
+    }
+}
+
+template <typename T>
+__global__ void FastllmCudaDFlashScaleBackKernel(
+        const half *src, T *dst, const float *scale, int m, int len) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < len) {
+        dst[i] = FastllmCudaDFlashFloatTo<T>(
+            __half2float(src[i]) * scale[i / m]);
+    }
+}
+
+// 逐行 absmax → 2 的幂 scale，并把 FP32 输入缩放后转成 FP16 写入 halfOut。
+// 返回 false 表示不支持（非 FP32 输入 / 分配失败），调用方应退回直接 cast。
+bool FastllmCudaDFlashScaleToHalf(const fastllm::Data &input,
+                                  fastllm::Data &halfOut, float headroom) {
+    if (input.dims.empty() || input.cudaData == nullptr) {
+        return false;
+    }
+    const fastllm::DataType inType = input.dataType;
+    if (inType != fastllm::DataType::FLOAT32 &&
+        inType != fastllm::DataType::FLOAT16 &&
+        inType != fastllm::DataType::BFLOAT16) {
+        return false;
+    }
+    const int m = input.dims.back();
+    const int len = (int)input.Count(0);
+    if (m <= 0 || len <= 0 || len % m != 0) {
+        return false;
+    }
+    const int rows = len / m;
+    if (!FastllmCudaDFlashEnsureRowScale(rows)) {
+        return false;
+    }
+    int device = FastllmCudaGetDevice();
+    if (device < 0 || device >= 64) {
+        device = 0;
+    }
+    FastllmCudaDFlashRowScaleScratch &b =
+        gFastllmCudaDFlashRowScaleScratch[device];
+
+    // 用框架的转换路径取得"设备正确 + 容量合适"的 FP16 缓冲。不能直接用
+    // Resize+Allocate：新建的 Data 默认在 CPU 设备上，Allocate 只会分配 host
+    // 内存，cudaData 始终是 nullptr（缩放会因此静默失效）。这里与基线的
+    // ToDataType 调用完全一致，因此不会多占显存。
+    // 随后下面的 scaled cast 会用缩放后的值覆盖这块缓冲。
+    fastllm::ToDataType(input, halfOut, fastllm::DataType::FLOAT16);
+    if (halfOut.cudaData == nullptr) {
+        return false;
+    }
+
+    const int threads = 256;
+    const int castBlocks = (len - 1) / threads + 1;
+    switch (inType) {
+        case fastllm::DataType::FLOAT32:
+            FastllmCudaDFlashAbsMaxPerRowKernel<float> <<< rows, threads >>>(
+                (const float *) input.cudaData, m, b.rowMax);
+            FastllmCudaDFlashRowScaleKernel <<< (rows - 1) / threads + 1, threads >>>(
+                b.rowMax, b.scale, b.invScale, rows, headroom);
+            FastllmCudaDFlashScaleToHalfKernel<float> <<< castBlocks, threads >>>(
+                (const float *) input.cudaData, (half *) halfOut.cudaData,
+                b.invScale, m, len);
+            break;
+        case fastllm::DataType::FLOAT16:
+            FastllmCudaDFlashAbsMaxPerRowKernel<half> <<< rows, threads >>>(
+                (const half *) input.cudaData, m, b.rowMax);
+            FastllmCudaDFlashRowScaleKernel <<< (rows - 1) / threads + 1, threads >>>(
+                b.rowMax, b.scale, b.invScale, rows, headroom);
+            FastllmCudaDFlashScaleToHalfKernel<half> <<< castBlocks, threads >>>(
+                (const half *) input.cudaData, (half *) halfOut.cudaData,
+                b.invScale, m, len);
+            break;
+        case fastllm::DataType::BFLOAT16:
+            FastllmCudaDFlashAbsMaxPerRowKernel<__nv_bfloat16> <<< rows, threads >>>(
+                (const __nv_bfloat16 *) input.cudaData, m, b.rowMax);
+            FastllmCudaDFlashRowScaleKernel <<< (rows - 1) / threads + 1, threads >>>(
+                b.rowMax, b.scale, b.invScale, rows, headroom);
+            FastllmCudaDFlashScaleToHalfKernel<__nv_bfloat16> <<< castBlocks, threads >>>(
+                (const __nv_bfloat16 *) input.cudaData, (half *) halfOut.cudaData,
+                b.invScale, m, len);
+            break;
+        default:
+            return false;
+    }
+    return true;
+}
+
+// 把 GEMM 的 FP16 输出按行乘回 scale，并原地转成 outType
+// （只支持 FLOAT16 / BFLOAT16 —— 元素宽度相同，可复用同一块缓冲）。
+bool FastllmCudaDFlashScaleBack(fastllm::Data &halfOutput,
+                                const fastllm::Data &outLike) {
+    const fastllm::DataType outType = outLike.dataType;
+    if (halfOutput.dataType != fastllm::DataType::FLOAT16 ||
+        halfOutput.cudaData == nullptr || halfOutput.dims.empty()) {
+        return false;
+    }
+    if (outType != fastllm::DataType::FLOAT16 &&
+        outType != fastllm::DataType::BFLOAT16) {
+        return false;
+    }
+    const int m = halfOutput.dims.back();
+    const int len = (int)halfOutput.Count(0);
+    if (m <= 0 || len <= 0 || len % m != 0) {
+        return false;
+    }
+    const int rows = len / m;
+    int device = FastllmCudaGetDevice();
+    if (device < 0 || device >= 64) {
+        device = 0;
+    }
+    FastllmCudaDFlashRowScaleScratch &b =
+        gFastllmCudaDFlashRowScaleScratch[device];
+    if (b.capacity < rows) {
+        return false;
+    }
+    const int threads = 256;
+    const int blocks = (len - 1) / threads + 1;
+    if (outType == fastllm::DataType::BFLOAT16) {
+        FastllmCudaDFlashScaleBackKernel<__nv_bfloat16> <<< blocks, threads >>>(
+            (const half *) halfOutput.cudaData,
+            (__nv_bfloat16 *) halfOutput.cudaData, b.scale, m, len);
+    } else {
+        FastllmCudaDFlashScaleBackKernel<half> <<< blocks, threads >>>(
+            (const half *) halfOutput.cudaData, (half *) halfOutput.cudaData,
+            b.scale, m, len);
+    }
+    halfOutput.dataType = outType;
+    return true;
+}
+
 template <typename T>
 __device__ __forceinline__ T FastllmCudaNVFP4FloatToValue(float value);
 

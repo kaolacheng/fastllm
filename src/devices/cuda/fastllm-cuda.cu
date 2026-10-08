@@ -284,12 +284,16 @@ bool FastllmCudaGetNcclForceSync() {
 static void FastllmCudaPrintMallocStack(size_t size, const char *file, int line, bool rejected) {
     std::lock_guard<std::mutex> lock(fastllmCudaMallocCheckMutex);
     fprintf(stderr,
-            "[FASTLLM_CUDA_MEM_CHECK] cudaMalloc %s size=%zu bytes (%.2f MB) at %s:%d\n",
+            "[FASTLLM_CUDA_MEM_CHECK] cudaMalloc dev=%d %s size=%zu bytes (%.2f MB) at %s:%d\n",
+            (int)FastllmCudaGetDevice(),
             rejected ? "rejected" : "called",
             size,
             (double)size / (1024.0 * 1024.0),
             file == nullptr ? "<unknown>" : file,
             line);
+    if (std::getenv("FASTLLM_CUDA_MEM_CHECK_STACK") == nullptr) {
+        return;
+    }
 #if defined(__linux__) || defined(__APPLE__)
     const int maxFrames = 64;
     void *frames[maxFrames];
@@ -15451,19 +15455,15 @@ __global__ void FastllmDFlashPrepareGateupBf16Kernel(
     int channel = index - token * intermediateSize;
     const __nv_bfloat16 *row = gateup +
         (size_t)token * 2 * intermediateSize;
-    half gate = __float2half_rz(__bfloat162float(row[channel]));
-    half up = __float2half_rz(
-        __bfloat162float(row[intermediateSize + channel]));
-#ifdef CUDA_NO_TENSOR_CORE
-    float gateFloat = __half2float(gate);
-    gate = __float2half(gateFloat / (1.0 + expf(-gateFloat)));
-    gate = __float2half(
-        __half2float(up) * 1.0f * __half2float(gate));
-#else
-    gate = __hdiv(gate, __hadd(__float2half(1.0), hexp(-gate)));
-    gate *= (half)((float)up * 1.0f);
-#endif
-    output[index] = __float2bfloat16_rn(__half2float(gate));
+    // silu(gate)*up 在 FP32 里算, 结果按 BF16 RNE 舍入 —— 与检查点的
+    // bf16 训练语义一致, 且没有任何 FP16 窄点。旧实现先把 gate/up cast 到
+    // FP16 再算乘积: gate/up 各自 O(1e3) 没问题, 但乘积可达 ~1e7, 直接越
+    // 过 65504 变成 inf(实测 L0 mlp.silu_out 非有限=6703), 污染整条 MLP。
+    // expf/hexp 的差别只在 ulp 级, 对草稿接受率无影响。
+    const float gate = __bfloat162float(row[channel]);
+    const float up = __bfloat162float(row[intermediateSize + channel]);
+    const float result = gate * up / (1.0f + expf(-gate));
+    output[index] = __float2bfloat16_rn(result);
 }
 
 bool FastllmCudaDFlashPrepareGateup(
