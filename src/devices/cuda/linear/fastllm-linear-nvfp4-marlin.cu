@@ -169,12 +169,26 @@ static bool Nvfp4PrefillCublas(fastllm_cuda_prefill::State *state,
     return true;
 }
 
+// The packed E4M3 representation stores the raw one-byte block scale in the
+// source rows; decode it in place of the expanded float scale so the Marlin
+// preparation never has to materialize the twelve-byte layout.
+__device__ __forceinline__ float Nvfp4MarlinE4M3ScaleToFloat(uint8_t value) {
+    const uint32_t exponent = (value >> 3) & 15;
+    const uint32_t mantissa = value & 7;
+    const float magnitude = exponent == 0 ? mantissa * 0.001953125f :
+        __uint_as_float(((exponent + 120) << 23) | (mantissa << 20));
+    return (value & 128) ? -magnitude : magnitude;
+}
+
 static bool HasNvfp4MarlinOnDevice(const fastllm::Data &weight) {
     // IsRepacked is shared with the SM70 TurboMind representation. Include
     // the current architecture in the discriminator so the SM70 layout is
     // not interpreted as Marlin (or vice versa) during generic dispatch.
+    const bool nvfp4Source =
+        weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 ||
+        weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED;
     return weight.cudaData != nullptr &&
-           weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 &&
+           nvfp4Source &&
            weight.blockM == NVFP4_GROUP_SIZE && weight.blockK == 1 &&
            weight.IsRepacked && !weight.cudaNativeNvfp4Layout && Nvfp4MarlinArchitectureSupported();
 }
@@ -258,22 +272,28 @@ static bool GetNvfp4MarlinTailPointers(
     return true;
 }
 
-// Convert FastLLM's interleaved source into two temporary standard layouts:
+// Convert FastLLM's source layout into two temporary standard layouts:
 //   qweight: [K / 8, N] uint32, ready for gptq_marlin_repack(num_bits=4)
 //   scales:  vLLM marlin_permute_scales followed by NVFP4 S0E5M3 processing
 // Both destinations are temporary so that writes cannot overwrite unread
-// source rows while performing the in-place conversion.
+// source rows while performing the in-place conversion.  The source is either
+// the interleaved twelve-byte block layout or the compact packed layout
+// (four-byte row-global multiplier followed by nine-byte blocks carrying the
+// raw E4M3 scale byte).
+template<bool SourceCompact>
 __global__ void FastllmNvfp4BuildMarlinInputsKernel(
         const uint8_t *__restrict__ source,
         uint32_t *__restrict__ qweight,
         uint8_t *__restrict__ scales,
-        int logicalN, int sizeN, int sizeK, float commonGlobalScale) {
+        int logicalN, int sizeN, int sizeK, int sourceRowBytes,
+        float commonGlobalScale) {
     size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const int groups = sizeK / NVFP4_GROUP_SIZE;
     const int packs = sizeK / 8;
     const size_t qweightCount = (size_t)packs * sizeN;
     const size_t scaleCount = (size_t)groups * sizeN;
-    const int sourceRowBytes = groups * (8 + (int)sizeof(float));
+    const int groupStride = SourceCompact ? 9 : 12;
+    const size_t rowPayload = SourceCompact ? sizeof(float) : 0;
 
     if (id < qweightCount) {
         int pack = id / sizeN;
@@ -283,8 +303,17 @@ __global__ void FastllmNvfp4BuildMarlinInputsKernel(
         uint32_t packed = 0;
         if (out < logicalN) {
             const uint8_t *src = source + (size_t)out * sourceRowBytes +
-                                 group * 12 + word * 4;
-            packed = *reinterpret_cast<const uint32_t *>(src);
+                                 rowPayload + group * groupStride + word * 4;
+            if (SourceCompact) {
+                // Nine-byte blocks are not four-byte aligned for most group
+                // indices, so assemble the packed word from byte loads.
+                packed = static_cast<uint32_t>(src[0]) |
+                         (static_cast<uint32_t>(src[1]) << 8) |
+                         (static_cast<uint32_t>(src[2]) << 16) |
+                         (static_cast<uint32_t>(src[3]) << 24);
+            } else {
+                packed = *reinterpret_cast<const uint32_t *>(src);
+            }
         }
         qweight[id] = packed;
     }
@@ -303,9 +332,16 @@ __global__ void FastllmNvfp4BuildMarlinInputsKernel(
 
         float effectiveScale = 0.0f;
         if (out < logicalN) {
-            const uint8_t *src = source + (size_t)out * sourceRowBytes +
-                                 group * 12 + 8;
-            effectiveScale = *reinterpret_cast<const float *>(src);
+            const uint8_t *row = source + (size_t)out * sourceRowBytes +
+                                 rowPayload + group * groupStride;
+            if (SourceCompact) {
+                const float rowGlobal = *reinterpret_cast<const float *>(
+                    source + (size_t)out * sourceRowBytes);
+                effectiveScale =
+                    Nvfp4MarlinE4M3ScaleToFloat(row[8]) * rowGlobal;
+            } else {
+                effectiveScale = *reinterpret_cast<const float *>(row + 8);
+            }
         }
         half normalized = __float2half_rn(effectiveScale / commonGlobalScale);
         half shifted = __hmul(normalized, __float2half_rn(128.0f));
@@ -379,10 +415,29 @@ static bool EnsureNvfp4MarlinOnDevice(fastllm::Data &weight,
     const size_t workItems = std::max(qweightCount, scaleCount);
     const int threads = 256;
     const int blocks = static_cast<int>((workItems + threads - 1) / threads);
-    FastllmNvfp4BuildMarlinInputsKernel<<<blocks, threads, 0,
-                                          cudaStreamPerThread>>>(
-        static_cast<const uint8_t *>(weight.cudaData), standardQweight,
-        temporaryScales, logicalN, sizeN, sizeK, commonGlobalScale);
+    const bool sourceCompact =
+        weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED;
+    // Source rows hold sizeK values each (n == logicalN rows x sizeK
+    // values/row); sizeN is the padded output dim used only for the
+    // qweight grid. Striding with sizeN reads past the buffer end on
+    // non-square weights.
+    const int sourceRowBytes = sourceCompact
+        ? (int)fastllm::GetDataBytes(
+              fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED, 1, sizeK)
+        : (sizeK / NVFP4_GROUP_SIZE) * (8 + (int)sizeof(float));
+    if (sourceCompact) {
+        FastllmNvfp4BuildMarlinInputsKernel<true><<<blocks, threads, 0,
+                cudaStreamPerThread>>>(
+            static_cast<const uint8_t *>(weight.cudaData), standardQweight,
+            temporaryScales, logicalN, sizeN, sizeK, sourceRowBytes,
+            commonGlobalScale);
+    } else {
+        FastllmNvfp4BuildMarlinInputsKernel<false><<<blocks, threads, 0,
+                cudaStreamPerThread>>>(
+            static_cast<const uint8_t *>(weight.cudaData), standardQweight,
+            temporaryScales, logicalN, sizeN, sizeK, sourceRowBytes,
+            commonGlobalScale);
+    }
 
     bool repacked = cudaPeekAtLastError() == cudaSuccess &&
                     FastllmCudaGptqMarlinRepackBitsStream(
@@ -452,7 +507,8 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
     }
     // Repacked weights must keep using a backend that understands Marlin layout.
     if (!HasNvfp4MarlinOnDevice(weight)) {
-        if (weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 ||
+        if (weight.dataType != fastllm::DataType::NVFP4_BLOCK_16 &&
+            weight.dataType != fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
             weight.blockM != NVFP4_GROUP_SIZE || weight.blockK != 1 ||
             weight.scales.empty()) {
             return false;

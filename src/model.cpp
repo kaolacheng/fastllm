@@ -98,7 +98,26 @@ namespace fastllm {
             }
             memcpy(dst, src, len * unitSize);
         } else if (srcDtype == DataType::FP8_E4M3 && dstDtype == DataType::FLOAT16) {
-            ErrorInFastLLM("ConvertDataType Failed. (" + std::to_string(srcDtype) + " -> " + std::to_string(dstDtype) + ")");
+            // E4M3 -> FP16 is exact: 3-bit mantissa fits the 10-bit half
+            // mantissa and the value range (2^-9..448) fits 2^-14..65504.
+            uint16_t *u16dst = (uint16_t*)dst;
+            const uint8_t *u8src = (const uint8_t*)src;
+            for (uint64_t i = 0; i < len; i++) {
+                const uint8_t b = u8src[i];
+                float v;
+                if ((b & 0x7F) == 0x7F) {
+                    v = std::nanf("");
+                } else {
+                    const int sign = (b >> 7) & 1;
+                    const int exp = (b >> 3) & 15;
+                    const int man = b & 7;
+                    v = exp == 0 ? (float)std::ldexp((double)man, -9)
+                                 : (1.0f + man * 0.125f) * (float)std::ldexp(1.0, exp - 7);
+                    if (sign)
+                        v = -v;
+                }
+                u16dst[i] = float_to_half(v);
+            }
         } else if (srcDtype == DataType::BFLOAT16 && dstDtype == DataType::FLOAT32) {
             uint16_t *u16dst = (uint16_t*)dst;
             uint16_t *u16src = (uint16_t*)src;
@@ -117,6 +136,25 @@ namespace fastllm {
             uint16_t *u16src = (uint16_t*)src;
             for (size_t i = 0; i < len; i++) {
                 fdst[i] = half_to_float(u16src[i]);
+            }
+        } else if (srcDtype == DataType::FP8_E4M3 && dstDtype == DataType::FLOAT32) {
+            // E4M3 (bias 7, no inf; 0x7F/0xFF are NaN) to FP32. Used by NVFP4
+            // safetensors loads that keep block scales as raw E4M3 on disk but
+            // request an FP32 scale buffer (NVFP4_BLOCK_16-style layout).
+            float *fdst = (float*)dst;
+            const uint8_t *u8src = (const uint8_t*)src;
+            for (uint64_t i = 0; i < len; i++) {
+                const uint8_t b = u8src[i];
+                if ((b & 0x7F) == 0x7F) {
+                    fdst[i] = std::nanf("");
+                    continue;
+                }
+                const int sign = (b >> 7) & 1;
+                const int exp = (b >> 3) & 15;
+                const int man = b & 7;
+                float v = exp == 0 ? (float)std::ldexp((double)man, -9)
+                                   : (1.0f + man * 0.125f) * (float)std::ldexp(1.0, exp - 7);
+                fdst[i] = sign ? -v : v;
             }
         } else {
             ErrorInFastLLM("ConvertDataType Failed. (" + std::to_string(srcDtype) + " -> " + std::to_string(dstDtype) + ")");
@@ -219,6 +257,7 @@ namespace fastllm {
 #endif
         this->deviceMap = GetDeviceMap();
         this->moeDeviceMap = GetMoeDeviceMap();
+        { std::cerr << "[DBG] deviceMap:"; for (auto &kv : this->deviceMap) std::cerr << " " << kv.first << "=" << kv.second; std::cerr << " | moeDeviceMap:"; for (auto &kv : this->moeDeviceMap) std::cerr << " " << kv.first << "=" << kv.second; std::cerr << std::endl; }
         this->layeredMoeDeviceMap = GetLayeredMoeDeviceMap();
         this->moeDeviceLayers = GetMoeDeviceLayers();
         this->ngramDevice = GetNgramDevice();
@@ -290,24 +329,49 @@ namespace fastllm {
     bool basellm::PrepareMoeCudaCache(
             const std::vector<std::vector<Data *>> &layerWeights) {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
+        std::fprintf(stderr,
+            "[Fastllm][DBG-mcpp] PrepareMoeCudaCache: cacheBytes=%lld "
+            "layerWeights=%zu\n",
+            (long long)fastllm::GetMoeCudaCacheBytes(), layerWeights.size());
         if (!FastllmCudaMoeCacheRequested() || layerWeights.empty()) {
+            std::fprintf(stderr,
+                "[Fastllm][DBG-mcpp] silent false: requested=%d empty=%d\n",
+                (int)FastllmCudaMoeCacheRequested(),
+                (int)layerWeights.empty());
             return false;
         }
         std::vector<FastllmCudaMoeCacheLayer> layers;
         layers.reserve(layerWeights.size());
         bool allNuma = true;
+        int skipped = 0;
         for (int layer = 0; layer < static_cast<int>(layerWeights.size()); ++layer) {
             const std::string device = SelectMoeDeviceForLayer(layer);
             // GPU-resident layers keep their own expert layout. Register only
             // host tables, including when the first layer resides on CUDA.
             const bool numa = device == "numa" || device.compare(0, 5, "numa:") == 0;
-            if (device != "cpu" && !numa) continue;
+            if (device != "cpu" && !numa) { skipped++; continue; }
+            if (layer < 4 || layer >= (int)layerWeights.size() - 2)
+                std::fprintf(stderr,
+                    "[Fastllm][DBG-mcpp] layer %d device=%s wsize=%zu\n",
+                    layer, device.c_str(), layerWeights[layer].size());
             allNuma = allNuma && numa;
             const auto &weights = layerWeights[layer];
+            // NVFP4_BLOCK_16_E4M3_PACKED experts belong to the "glm5" format
+            // family (see the cache backend table and the consistency check in
+            // FastllmCudaPrepareMoeCache); the layer must declare it or the
+            // packed-NVFP4 cache is silently rejected. Mirror glm5_next.
+            const bool packedNVFP4 = weights.size() > 2 && weights[2] &&
+                weights[2]->dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED;
             layers.push_back({
                 weights.data(),
-                static_cast<int>(weights.size())});
+                static_cast<int>(weights.size()),
+                false,
+                0.0f,
+                packedNVFP4});
         }
+        std::fprintf(stderr,
+            "[Fastllm][DBG-mcpp] layers kept=%zu skipped=%d allNuma=%d\n",
+            layers.size(), skipped, (int)allNuma);
         if (layers.empty()) return false;
         std::function<void()> registerNumaWeights;
 #ifdef USE_NUMAS
@@ -5306,10 +5370,16 @@ namespace fastllm {
                                 oriDataType = DataType::FLOAT16;
                             }
                             if (tensor.dtype == "F8_E4M3" &&
-                                (dataType == DataType::FLOAT32 || dataType == DataType::FLOAT16 || dataType == DataType::INT8
+                                (dataType == DataType::FLOAT32 || dataType == DataType::FLOAT16 ||
+                                 dataType == DataType::BFLOAT16 ||
+                                 dataType == DataType::INT8
                                 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO
                                 || dataType == DataType::INT2_GROUP
                                 || dataType == DataType::DATA_GGUF_FORMAT)) {
+                                // 带 weight_scale 的 FP8 权重必须走"去量化"入口：
+                                // 漏掉某个目标类型就会把 weight_scale 当成无关张量
+                                // 丢掉，原始 E4M3 码值（±448）直接当成权重，量级
+                                // 偏大 1/scale（实测 DFlash2 草稿偏大 57~340×）。
                                 oriDataType = DataType::FLOAT32;
                                 scaleTensorName = FindSafeTensorScaleTensorName(safeTensors, tensorName);
                             }
@@ -6069,7 +6139,9 @@ namespace fastllm {
                                 oriDataType = DataType::FLOAT16;
                             }
                             if (tensor.dtype == "F8_E4M3" && 
-                                (dataType == DataType::FLOAT32 || dataType == DataType::FLOAT16 || dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO || dataType == DataType::DATA_GGUF_FORMAT)) {
+                                (dataType == DataType::FLOAT32 || dataType == DataType::FLOAT16 || dataType == DataType::BFLOAT16 || dataType == DataType::INT8 || dataType == DataType::INT4_GROUP || dataType == DataType::INT4_NOZERO || dataType == DataType::DATA_GGUF_FORMAT)) {
+                                // 与上面的加载分支保持一致：BF16 目标同样必须应用
+                                // weight_scale，否则导出的权重会被放大 1/scale。
                                 oriDataType = DataType::FLOAT32;
                                 scaleTensorName = FindSafeTensorScaleTensorName(safeTensors, tensor.tensorName);
                             }

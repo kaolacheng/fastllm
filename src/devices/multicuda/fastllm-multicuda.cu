@@ -690,7 +690,8 @@ static void InitMultiCudaLocalTensorMeta(const fastllm::Data &src, fastllm::Data
     // Marlin layout, so every tensor-parallel shard must retain that metadata.
     // Shape-dependent scale arrays for other formats are split below instead.
     if (src.dataType == fastllm::DataType::NVFP4_BLOCK_16 ||
-        src.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3) {
+        src.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3 ||
+        src.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
         dst.scales = src.scales;
     }
     dst.perChannelAxis = src.perChannelAxis;
@@ -1325,7 +1326,8 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                 }
             } else if (weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 ||
                        weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E8M0 ||
-                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_32_E8M0) {
+                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_32_E8M0 ||
+                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
                 size_t rowBytes = fastllm::GetDataBytes(weight.dataType, 1, m);
                 if (mallocType == 0) {
                     cudaSetDevice(rootDevice);
@@ -1517,12 +1519,18 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                 }
             } else if (weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 ||
                        weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E8M0 ||
-                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_32_E8M0) {
+                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_32_E8M0 ||
+                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
                 const size_t packedBlock = weight.dataType ==
                         fastllm::DataType::NVFP4_BLOCK_32_E8M0 ? 32 : 16;
+                const bool packedE4M3 = weight.dataType ==
+                        fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED;
                 const size_t blockBytes = weight.dataType ==
                         fastllm::DataType::NVFP4_BLOCK_16 ?
-                    8 + sizeof(float) : packedBlock / 2 + sizeof(uint8_t);
+                    8 + sizeof(float) : packedE4M3 ? 9 : packedBlock / 2 + sizeof(uint8_t);
+                // The packed E4M3 rows keep a four-byte row-global multiplier
+                // before the nine-byte blocks, so every slice starts past it.
+                const size_t rowPayload = packedE4M3 ? sizeof(float) : 0;
                 size_t srcRowBytes = fastllm::GetDataBytes(weight.dataType, 1, m);
                 size_t dstRowBytes = fastllm::GetDataBytes(weight.dataType, 1, len);
                 for (auto &it : div) {
@@ -1535,9 +1543,9 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     if (mallocType == 0) {
                         cudaSetDevice(rootDevice);
                     }
-                    size_t dstOffsetBytes =
+                    size_t dstOffsetBytes = rowPayload +
                         static_cast<size_t>(curLen / packedBlock) * blockBytes;
-                    size_t srcOffsetBytes =
+                    size_t srcOffsetBytes = rowPayload +
                         static_cast<size_t>(it.first / packedBlock) * blockBytes;
                     size_t copyBytes =
                         static_cast<size_t>(copyLen / packedBlock) * blockBytes;
@@ -1551,6 +1559,17 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                         break;
                     }
                     curLen += copyLen;
+                }
+                if (packedE4M3 && state == cudaSuccess) {
+                    // The four-byte per-row global multiplier precedes the nine
+                    // byte blocks and belongs to no slice, so replicate the
+                    // source row headers onto every destination row.
+                    state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData,
+                                                dstRowBytes,
+                                                (uint8_t*)sourceWeightData,
+                                                srcRowBytes,
+                                                sizeof(float),
+                                                kSize, GetCudaMemcpyType(mallocType, sourceWeightType), deviceId, rootDevice);
                 }
             } else {
                 for (auto &it : div) {

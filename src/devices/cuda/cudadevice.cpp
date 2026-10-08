@@ -6486,7 +6486,8 @@ namespace fastllm {
 
         if (FastllmCudaNativeFp8FusedCanRun(input, weight, bias, output, false) &&
             FastllmCudaNativeFp8Fused(input, weight, output, false)) return;
-        if (weight.dataType == DataType::NVFP4_BLOCK_16) {
+        if (weight.dataType == DataType::NVFP4_BLOCK_16 ||
+            weight.dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
             CudaNvfp4LinearAddBlock(input, weight, bias, middle, output);
             return;
         }
@@ -6669,7 +6670,8 @@ namespace fastllm {
 
         if (FastllmCudaNativeFp8FusedCanRun(input, weight, bias, output, true) &&
             FastllmCudaNativeFp8Fused(input, weight, output, true)) return;
-        if (weight.dataType == DataType::NVFP4_BLOCK_16) {
+        if (weight.dataType == DataType::NVFP4_BLOCK_16 ||
+            weight.dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
             CudaNvfp4LinearSwigluBlock(input, weight, bias, middle, output);
             return;
         }

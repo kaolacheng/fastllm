@@ -3690,7 +3690,8 @@ namespace fastllm {
 
             DoCudaLinearReshape(*input, *weight0, *w3);
             DoCudaSwigluReshape(*w3, *w1);
-            if (weight0->dataType == DataType::NVFP4_BLOCK_16 &&
+            if ((weight0->dataType == DataType::NVFP4_BLOCK_16 ||
+                 weight0->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) &&
                 MultiCudaEnvFlagEnabled("FASTLLM_TP_NVFP4_MLP_SWIGLU", true)) {
                 // CanRun requires the final shape and allocation, including
                 // its owning rank. The block performs the complete fallback
