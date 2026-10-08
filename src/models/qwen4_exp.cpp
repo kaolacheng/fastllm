@@ -1449,6 +1449,7 @@ namespace fastllm {
         bool hostMoe = false;
         std::vector<bool> hostMoeLayers;
         int loadingExpertLayer = -1;
+        std::vector<std::string> loadingReplicas;
 #if defined(USE_CUDA) && !defined(USE_ROCM)
         std::shared_ptr<FastllmCudaMoeExpertParallel> expertParallel;
 #endif
@@ -1557,13 +1558,25 @@ namespace fastllm {
         }
         return scheme;
     }
+
+    static void Qwen4CopyTpReplica(const Data &source, Data &local, int device) {
+        FastllmCudaSetDevice(device);
+        local.CopyFrom(source);
+        local.isModelWeight = true;
+        local.weightType = source.weightType;
+        local.scales = source.scales;
+        local.blockK = source.blockK;
+        local.blockM = source.blockM;
+        local.ToDevice(DataDevice::CUDA, std::vector<int>{device});
+    }
 #endif
 
     int Qwen4ExpModel::StreamingThreadTpExpertLayer(const std::string &name) const {
 #ifdef USE_CUDA
-        const auto arch = weight.dicts.find("gguf_architecture");
-        if (!threadTpState || threadTpRank >= 0 ||
-            arch == weight.dicts.end() || arch->second != "qwen4exp") return -1;
+        if (!threadTpState || threadTpRank >= 0) return -1;
+        if (Qwen4StartsWith(name, kMtpExpertPrefix)) {
+            return threadTpState->hostMoeLayers.back() ? -1 : block_cnt;
+        }
         const std::string prefix = languagePrefix + "layers.";
         if (!Qwen4StartsWith(name, prefix)) return -1;
         const char *start = name.c_str() + prefix.size();
@@ -1578,22 +1591,51 @@ namespace fastllm {
 #endif
     }
 
+    int Qwen4ExpModel::StreamingThreadTpReplicaLayer(const std::string &name) const {
+#ifdef USE_CUDA
+        if (!threadTpState || threadTpRank >= 0 ||
+            (!Qwen4StartsWith(name, languagePrefix) && !Qwen4StartsWith(name, "mtp."))) return -1;
+        // These projections are replicated unchanged on every TP rank. Keep
+        // norms and lookup tables on the host for PrepareWeights and sharing.
+        if (!Qwen4EndsWith(name, ".input_mix_weight_down.weight") &&
+            !Qwen4EndsWith(name, ".input_mix_weight_up.weight") &&
+            !Qwen4EndsWith(name, ".block_inject_weight.weight") &&
+            !Qwen4EndsWith(name, ".mlp.gate.weight") &&
+            !Qwen4EndsWith(name, ".ple.key_proj.weight") &&
+            !Qwen4EndsWith(name, ".ple.value_proj.weight") &&
+            name != "mtp.fc_embedding.weight" && name != "mtp.fc_hidden.weight") return -1;
+        const std::string prefix = languagePrefix + "layers.";
+        if (!Qwen4StartsWith(name, prefix)) return block_cnt;
+        return std::atoi(name.c_str() + prefix.size());
+#else
+        return -1;
+#endif
+    }
+
     int Qwen4ExpModel::GetWeightLoadPriority(const std::string &tensorName,
             const std::vector<std::pair<std::string, DataType>> &) const {
         const int layer = StreamingThreadTpExpertLayer(tensorName);
-        return layer < 0 ? 0 : layer - block_cnt;
+        if (layer >= 0) return layer - block_cnt;
+        const int replicaLayer = StreamingThreadTpReplicaLayer(tensorName);
+        if (replicaLayer < 0) return 0;
+        return replicaLayer == block_cnt ? -block_cnt - 1 : replicaLayer - block_cnt;
     }
 
     bool Qwen4ExpModel::ShouldLoadWeightSeriallyBeforeOthers(const std::string &tensorName,
             const std::vector<std::pair<std::string, DataType>> &) const {
-        return StreamingThreadTpExpertLayer(tensorName) >= 0;
+        return StreamingThreadTpExpertLayer(tensorName) >= 0 ||
+            StreamingThreadTpReplicaLayer(tensorName) >= 0;
     }
 
     void Qwen4ExpModel::OnWeightLoadGroupStarted(const std::set<std::string> &names) {
         if (!threadTpState) return;
         int &current = threadTpState->loadingExpertLayer;
         current = -1;
+        threadTpState->loadingReplicas.clear();
         for (const auto &name : names) {
+            if (StreamingThreadTpReplicaLayer(name) >= 0) {
+                threadTpState->loadingReplicas.push_back(name);
+            }
             const int layer = StreamingThreadTpExpertLayer(name);
             if (layer < 0) continue;
             AssertInFastLLM(current < 0 || current == layer,
@@ -1604,30 +1646,49 @@ namespace fastllm {
 
     void Qwen4ExpModel::OnWeightLoadGroupFinished() {
 #ifdef USE_CUDA
-        if (!threadTpState || threadTpState->loadingExpertLayer < 0) return;
+        if (!threadTpState || (threadTpState->loadingExpertLayer < 0 &&
+                              threadTpState->loadingReplicas.empty())) return;
         const int layer = std::exchange(threadTpState->loadingExpertLayer, -1);
+        std::vector<std::string> replicas;
+        replicas.swap(threadTpState->loadingReplicas);
         auto &devices = threadTpState->devices;
-        const int previousDevice = FastllmCudaGetDevice();
+        Qwen4CudaDeviceGuard deviceGuard;
         // The loader has joined all readers and finished gate/up merging.
         // Upload one layer before reading the next; the parent owns the shards
         // until PrepareThreadTp transfers them to rank models. Splitting again
         // there reuses these shards without retaining or rereading CPU payloads.
-        for (int expert = 0; expert < num_experts; ++expert) {
-            const std::string prefix = languagePrefix + "layers." + std::to_string(layer) +
-                ".mlp.experts." + std::to_string(expert) + ".";
+        for (int expert = 0; layer >= 0 && expert < num_experts; ++expert) {
+            const std::string prefix = (layer == block_cnt ? kMtpExpertPrefix :
+                languagePrefix + "layers." + std::to_string(layer) + ".mlp.experts.") +
+                std::to_string(expert) + ".";
             Data &gate = weight.weight.at(prefix + "gateup_proj.weight");
             Data &down = weight.weight.at(prefix + "down_proj.weight");
             AssertInFastLLM(gate.dims.size() == 2 && down.dims.size() == 2,
                             "Qwen4 TP streaming expert has an invalid shape.");
             for (int axis : {0, 1}) {
                 Data &source = axis == 0 ? gate : down;
-                auto scheme = Qwen4ExpertTpDivision(source, down, devices, axis, layer);
+                auto scheme = Qwen4ExpertTpDivision(source, down, devices, axis,
+                                                    std::min(layer, block_cnt - 1));
                 Data bias;
                 AssertInFastLLM(SplitMultiCudaWeight(source, bias, devices, scheme, axis, true),
                                 "Qwen4 TP failed to stream " + source.name);
             }
         }
-        FastllmCudaSetDevice(previousDevice);
+        for (const std::string &name : replicas) {
+            Data &source = weight.weight.at(name);
+            AssertInFastLLM(source.cpuData && !source.multiDeviceData &&
+                            source.multiDeviceDatas.empty() && source.dims.size() == 2,
+                            "Qwen4 TP streaming replica has an invalid source: " + name);
+            // Own each completed replica even if a later allocation fails.
+            source.multiDeviceData = true;
+            for (int device : devices) {
+                auto local = std::make_unique<Data>();
+                Qwen4CopyTpReplica(source, *local, device);
+                source.multiDeviceDatas.emplace(device, local.get());
+                local.release();
+            }
+            source.FreeSpace();
+        }
 #if defined(__GLIBC__)
         malloc_trim(0);
 #endif
@@ -1693,6 +1754,27 @@ namespace fastllm {
     bool Qwen4ExpModel::ShouldDelaySpecialWeightCudaMove(const std::string &) const {
         // Splitting directly from host storage avoids loading all experts on rank 0.
         return threadTpState != nullptr;
+    }
+
+    std::string Qwen4ExpModel::SelectSpecialWeightDevice(
+            const std::string &weightName, int layerId) const {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        // The small draft stack runs repeatedly between target windows.
+        // Keep its experts on the single target GPU, outside the target's
+        // bounded expert cache. TP and pipeline placement retain their policy.
+        if (threadTpState == nullptr && threadTpRank < 0 &&
+            Qwen4StartsWith(weightName, kMtpExpertPrefix) &&
+            Qwen4EnvFlagEnabled("FASTLLM_QWEN4_MTP_GPU_EXPERTS", true) &&
+            deviceMap.size() == 1) {
+            const std::string &device = deviceMap.begin()->first;
+            if (device == "cuda" || device.compare(0, 5, "cuda:") == 0) {
+                std::map<int, int> ratios;
+                if (ParseDeviceIds(device, "cuda", ratios).size() <= 1)
+                    return device;
+            }
+        }
+#endif
+        return Qwen3NextModel::SelectSpecialWeightDevice(weightName, layerId);
     }
 
     bool Qwen4ExpModel::RetainCudaWorkspace() const {
@@ -1762,6 +1844,7 @@ namespace fastllm {
             model->ngramDevice = ngramDevice;
             model->pleNgramDiskWeight = pleNgramDiskWeight;
             model->pleNgramDiskWeight.isFake = true;
+            model->pleDiskReader = pleDiskReader;
             model->qsaKeyNormValues = qsaKeyNormValues;
             model->preparedWeights = true; // Parent already applied norm offsets.
             model->weights.assign(block_cnt, std::vector<Data *>(2 + 2 * num_experts, nullptr));
@@ -1920,21 +2003,25 @@ namespace fastllm {
                                        : equalScheme(source.dims[1]);
                 }
             }
+            const std::vector<int> originalDims = source.dims;
             if (axis >= 0) {
-                const std::vector<int> originalDims = source.dims;
                 if (source.dims.size() != 2) source.Reshape({source.dims[0], (int)source.Count(1)});
                 Data bias;
                 // Explicit head ranges must not be rotated by layer balancing.
                 bool compact = source.dataType == DataType::NVFP4_BLOCK_16_E4M3;
                 AssertInFastLLM(SplitMultiCudaWeight(source, bias, devices, scheme, axis, true, compact),
                                 "Qwen4 TP failed to split " + name);
+            }
+            if (source.multiDeviceData) {
+                // Both split weights and streamed replicas transfer their
+                // allocations to ranks without a CPU round trip.
                 for (int r = 0; r < count; ++r) {
                     Data *shard = source.multiDeviceDatas.at(devices[r]);
                     Data &local = tp.ranks[r]->weight[name];
                     local = *shard; // Transfer allocation ownership to the rank.
                     shard->isFake = true;
                     local.ClearTensorParallelLayout();
-                    if (originalDims.size() != 2) {
+                    if (axis >= 0 && originalDims.size() != 2) {
                         std::vector<int> dims = originalDims;
                         dims[0] = local.dims[0];
                         local.Reshape(dims);
@@ -1943,16 +2030,12 @@ namespace fastllm {
             } else {
                 source.ToDevice(DataDevice::CPU);
                 for (int r = 0; r < count; ++r) {
-                    FastllmCudaSetDevice(devices[r]);
-                    Data &local = tp.ranks[r]->weight[name];
-                    local.CopyFrom(source);
-                    local.isModelWeight = true;
-                    local.weightType = source.weightType;
-                    local.scales = source.scales;
-                    local.blockK = source.blockK;
-                    local.blockM = source.blockM;
-                    local.ToDevice(DataDevice::CUDA, std::vector<int>{devices[r]});
+                    Qwen4CopyTpReplica(source, tp.ranks[r]->weight[name], devices[r]);
                 }
+                // Rank-local copies own their CUDA storage. Host lookup tables
+                // shared by reference took the early continue above; no rank
+                // needs this replicated weight's parent CPU payload anymore.
+                source.FreeSpace();
             }
             if (source.dataType == DataType::NVFP4_BLOCK_16_E4M3 &&
                 expertWeight) {
@@ -1971,6 +2054,10 @@ namespace fastllm {
             }
         }
         FastllmCudaSetDevice(devices.front());
+#if defined(__GLIBC__)
+        // Return released TP source allocations before prefill warmup peaks.
+        malloc_trim(0);
+#endif
         std::printf("[Qwen4 TP] %d ranks ready (linear heads %d/%d, Q/KV heads %d/%d per rank).\n",
                     count, num_k_heads / count, num_v_heads / count,
                     num_attention_heads / count, std::max(1, num_key_value_heads / count));
@@ -2113,12 +2200,13 @@ namespace fastllm {
     }
 
     void Qwen4ExpModel::RunThreadTpPLE(const Data &hyperInput, const Data &inputIds,
-            RequestState &state, Data &output, const std::vector<int> *hostInputTokens) {
+            RequestState &state, Data &output, const std::vector<int> *hostInputTokens,
+            const DiskEmbeddingRowReader::Ticket *prefetched) {
 #ifdef USE_CUDA
         // PLE consumes replicated residuals. One lookup/projection/convolution
         // followed by a broadcast avoids four identical host reads and pool use.
         if (threadTpRank == 0) {
-            RunPLE(hyperInput, inputIds, state, output, hostInputTokens);
+            RunPLE(hyperInput, inputIds, state, output, hostInputTokens, prefetched);
         } else {
             // PLE's recurrent history belongs to rank zero, but prefix
             // matching and speculative rollback need the tokens on every rank.
@@ -3297,6 +3385,16 @@ namespace fastllm {
         this->pleNgramDiskWeight.dataDevice = DataDevice::CPU;
         this->pleNgramDiskWeight.isDiskWeight = true;
         this->pleNgramDiskWeight.diskWeightParts = std::move(parts);
+        // This cache stores compressed PLE rows in host memory. It is separate
+        // from expert residency and bounded even for very large ngram tables.
+        if (Qwen4EnvFlagEnabled("FASTLLM_PLE_PREFETCH", true)) {
+            const size_t cacheBytes = (size_t)std::max(0,
+                Qwen4EnvInt("FASTLLM_PLE_CACHE_BYTES", 64 * 1024 * 1024));
+            pleDiskReader = std::make_shared<DiskEmbeddingRowReader>(
+                pleNgramDiskWeight, cacheBytes);
+        } else {
+            pleDiskReader.reset();
+        }
         if (MoeCudaCacheRequested()) {
             PrepareWeights();
         }
@@ -3498,11 +3596,14 @@ namespace fastllm {
             if (hasMtpWeights && !weights.empty() && weights[0].size() > 2 &&
                 weights[0][2]->isGGUFData && mtpMoeWeights[2]->isGGUFData) {
                 // Original table addresses must be retained as cache keys.
-                // Main and draft experts share one budget and LRU pool.
+                // Only host-placed experts share the bounded cache. A
+                // GPU-resident draft table is kept outside this budget.
                 std::vector<FastllmCudaMoeCacheLayer> cacheLayers;
                 bool allNuma = true;
                 for (int layer = 0; layer <= block_cnt; ++layer) {
-                    const std::string device = SelectMoeDeviceForLayer(std::min(layer, block_cnt - 1));
+                    const std::string device = layer == block_cnt
+                        ? SelectSpecialWeightDevice(kMtpExpertPrefix + "0.gateup_proj.weight", block_cnt - 1)
+                        : SelectMoeDeviceForLayer(layer);
                     if (device != "cpu" && device != "numa" && device.compare(0, 5, "numa:") != 0) continue;
                     allNuma = allNuma && device != "cpu";
                     const auto &table = layer == block_cnt ? mtpMoeWeights : weights[layer];
@@ -3735,11 +3836,26 @@ namespace fastllm {
                     historyCount * sizeof(float));
     }
 
+    int64_t Qwen4ExpModel::PLEHashRow(const int *shifted, int head) const {
+        const int ngram = head / this->headsPerNgram + 2;
+        uint64_t mixedBits = (uint64_t)(int64_t)shifted[0] * this->pleMultipliers[0];
+        for (int position = 1; position < ngram; ++position) {
+            mixedBits ^= (uint64_t)(int64_t)shifted[position] * this->pleMultipliers[position];
+        }
+        int64_t mixedSigned;
+        std::memcpy(&mixedSigned, &mixedBits, sizeof(mixedSigned));
+        const int64_t vocab = this->pleHeadVocabSizes[head];
+        int64_t remainder = mixedSigned % vocab;
+        if (remainder < 0) remainder += vocab;
+        return this->pleHeadOffsets[head] + remainder;
+    }
+
     void Qwen4ExpModel::RunPLE(const Data &hyperInput,
                                const Data &inputIds,
                                RequestState &state,
                                Data &output,
-                               const std::vector<int> *hostInputTokens) {
+                               const std::vector<int> *hostInputTokens,
+                               const DiskEmbeddingRowReader::Ticket *prefetched) {
         AssertInFastLLM(inputIds.dims.size() == 2 && inputIds.dims[0] == 1,
                         "Qwen4-Exp PLE currently expects one request per forward.");
         const int batch = inputIds.dims[0];
@@ -3812,67 +3928,48 @@ namespace fastllm {
         for (int tokenIndex = 0; tokenIndex < sequence; tokenIndex++) {
             const int current = ids[tokenIndex];
             const int shifted[3] = {current, previous1, previous2};
-            for (int ngram = 2; ngram <= this->ngramSize; ngram++) {
-                uint64_t mixedBits =
-                    (uint64_t)(int64_t)shifted[0] * this->pleMultipliers[0];
-                for (int position = 1; position < ngram; position++) {
-                    mixedBits ^= (uint64_t)(int64_t)shifted[position] *
-                                 this->pleMultipliers[position];
+            for (int head = 0; head < this->ngramHeads; ++head) {
+                const int64_t globalRow = PLEHashRow(shifted, head);
+                const size_t lookupIndex =
+                    (size_t)tokenIndex * this->ngramHeads + head;
+                if (diskEmbedding) {
+                    AssertInFastLLM(
+                        globalRow >= 0 &&
+                            globalRow < this->pleNgramDiskWeight.dims[0],
+                        "Qwen4-Exp PLE hash selected an invalid disk row.");
+                    diskRows[lookupIndex] = (int32_t)globalRow;
+                    continue;
                 }
-                int64_t mixedSigned;
-                std::memcpy(&mixedSigned, &mixedBits, sizeof(mixedSigned));
-                const int headStart = (ngram - 2) * this->headsPerNgram;
-                for (int localHead = 0; localHead < this->headsPerNgram;
-                     localHead++) {
-                    const int head = headStart + localHead;
-                    const int64_t vocab = this->pleHeadVocabSizes[head];
-                    int64_t remainder = mixedSigned % vocab;
-                    if (remainder < 0) {
-                        remainder += vocab;
+                const int shardIndex = (int)(globalRow / rowsPerShard);
+                const int64_t shardRow = globalRow % rowsPerShard;
+                AssertInFastLLM(shardIndex >= 0 &&
+                                shardIndex < this->ngramShardCount,
+                                "Qwen4-Exp PLE hash selected an invalid shard.");
+                Data &shard = this->weight[embeddingPrefix + "shard_" +
+                                           std::to_string(shardIndex) +
+                                           ".weight"];
+                shard.ToDevice(DataDevice::CPU);
+                float *destination = embeddings.data() +
+                    lookupIndex * this->ngramHeadDim;
+                if (ggufEmbedding) {
+                    const auto toFloat = ggml_type_to_float((ggml_type)shard.ggmlType);
+                    AssertInFastLLM(toFloat != nullptr, "Qwen4 GGUF PLE type cannot be decoded.");
+                    const size_t rowBytes = ggml_row_size((ggml_type)shard.ggmlType, ngramHeadDim);
+                    toFloat(shard.cpuData + shardRow * rowBytes, destination, ngramHeadDim);
+                } else if (fp8Embedding) {
+                    const uint8_t *source = shard.cpuData +
+                        (size_t)shardRow * this->ngramHeadDim;
+                    for (int column = 0; column < this->ngramHeadDim; column++) {
+                        destination[column] =
+                            fp8Decoder.dict[source[column]] * embeddingScale;
                     }
-                    const int64_t globalRow =
-                        this->pleHeadOffsets[head] + remainder;
-                    const size_t lookupIndex =
-                        (size_t)tokenIndex * this->ngramHeads + head;
-                    if (diskEmbedding) {
-                        AssertInFastLLM(
-                            globalRow >= 0 &&
-                                globalRow < this->pleNgramDiskWeight.dims[0],
-                            "Qwen4-Exp PLE hash selected an invalid disk row.");
-                        diskRows[lookupIndex] = (int32_t)globalRow;
-                        continue;
-                    }
-                    const int shardIndex = (int)(globalRow / rowsPerShard);
-                    const int64_t shardRow = globalRow % rowsPerShard;
-                    AssertInFastLLM(shardIndex >= 0 &&
-                                    shardIndex < this->ngramShardCount,
-                                    "Qwen4-Exp PLE hash selected an invalid shard.");
-                    Data &shard = this->weight[embeddingPrefix + "shard_" +
-                                               std::to_string(shardIndex) +
-                                               ".weight"];
-                    shard.ToDevice(DataDevice::CPU);
-                    float *destination = embeddings.data() +
-                        lookupIndex * this->ngramHeadDim;
-                    if (ggufEmbedding) {
-                        const auto toFloat = ggml_type_to_float((ggml_type)shard.ggmlType);
-                        AssertInFastLLM(toFloat != nullptr, "Qwen4 GGUF PLE type cannot be decoded.");
-                        const size_t rowBytes = ggml_row_size((ggml_type)shard.ggmlType, ngramHeadDim);
-                        toFloat(shard.cpuData + shardRow * rowBytes, destination, ngramHeadDim);
-                    } else if (fp8Embedding) {
-                        const uint8_t *source = shard.cpuData +
-                            (size_t)shardRow * this->ngramHeadDim;
-                        for (int column = 0; column < this->ngramHeadDim; column++) {
-                            destination[column] =
-                                fp8Decoder.dict[source[column]] * embeddingScale;
-                        }
-                    } else {
-                        const uint16_t *source =
-                            reinterpret_cast<const uint16_t *>(shard.cpuData) +
-                            (size_t)shardRow * this->ngramHeadDim;
-                        for (int column = 0; column < this->ngramHeadDim; column++) {
-                            destination[column] =
-                                BFloat16BitsToFloat32(source[column]);
-                        }
+                } else {
+                    const uint16_t *source =
+                        reinterpret_cast<const uint16_t *>(shard.cpuData) +
+                        (size_t)shardRow * this->ngramHeadDim;
+                    for (int column = 0; column < this->ngramHeadDim; column++) {
+                        destination[column] =
+                            BFloat16BitsToFloat32(source[column]);
                     }
                 }
             }
@@ -3888,7 +3985,35 @@ namespace fastllm {
         state.previousToken1 = previous1;
         state.previousToken2 = previous2;
 
-        if (diskEmbedding) {
+        if (diskEmbedding && pleDiskReader) {
+            DiskEmbeddingRowReader::Ticket lookup;
+            if (prefetched && prefetched->values.valid() && prefetched->rows == diskRows) {
+                lookup = *prefetched;
+            } else {
+                lookup = pleDiskReader->ReadAsync(diskRows);
+            }
+            const auto &raw = lookup.values.get();
+            const size_t rowBytes = pleDiskReader->RowBytes();
+            AssertInFastLLM(raw.size() == diskRows.size() * rowBytes,
+                            "Qwen4 PLE prefetched row size mismatch.\n");
+            const auto toFloat = ggufEmbedding
+                ? ggml_type_to_float((ggml_type)firstShard.ggmlType) : nullptr;
+            AssertInFastLLM(!ggufEmbedding || toFloat, "Qwen4 GGUF PLE type cannot be decoded.\n");
+            for (size_t row = 0; row < diskRows.size(); ++row) {
+                const uint8_t *source = raw.data() + row * rowBytes;
+                float *destination = embeddings.data() + row * this->ngramHeadDim;
+                if (ggufEmbedding) {
+                    toFloat(source, destination, this->ngramHeadDim);
+                } else if (fp8Embedding) {
+                    for (int c = 0; c < this->ngramHeadDim; ++c)
+                        destination[c] = fp8Decoder.dict[source[c]] * embeddingScale;
+                } else {
+                    const auto *values = reinterpret_cast<const uint16_t *>(source);
+                    for (int c = 0; c < this->ngramHeadDim; ++c)
+                        destination[c] = BFloat16BitsToFloat32(values[c]);
+                }
+            }
+        } else if (diskEmbedding) {
             Data lookupRows(DataType::INT32,
                             {batch, sequence, this->ngramHeads});
             lookupRows.Allocate(false);
@@ -4869,6 +4994,15 @@ namespace fastllm {
     std::shared_ptr<Qwen4ExpModel::QsaHostMirrorTransfer> &
     Qwen4ExpModel::GetQsaHostMirror(RequestState &state, int layer) {
         auto &mirror = state.indexerHostMirrorTransfers[layer];
+        if (!mirror && servingCache) {
+            std::lock_guard<std::mutex> guard(stateMutex);
+            auto &spares = servingCache->qsaHostMirrors;
+            const auto found = spares.find(layer);
+            if (found != spares.end()) {
+                mirror = std::move(found->second);
+                spares.erase(found);
+            }
+        }
         if (!mirror) mirror = std::make_shared<QsaHostMirrorTransfer>();
         return mirror;
     }
@@ -6682,7 +6816,8 @@ namespace fastllm {
 
         const bool hostMoe = threadTpRank >= 0 && threadTpOwner->hostMoeLayers[deviceLayer];
         const bool runRoutedExperts = !hostMoe || threadTpRank == 0;
-        const std::string moeDevice = SelectMoeDeviceForLayer(deviceLayer);
+        const std::string moeDevice = SelectSpecialWeightDevice(
+            mlp + "experts.0.gateup_proj.weight", deviceLayer);
         Data routerLogits, expertIndex, expertScore, sharedOutput;
         if (runRoutedExperts) {
             Linear(flattened, this->weight[mlp + "gate.weight"],
@@ -6866,8 +7001,8 @@ namespace fastllm {
         // output transfer and ownership for serial layer transitions.
         const bool writeRoutedDirectly = hostMoe || useMoeCudaCache ||
             moeDevice == outputDevice;
-        if (!useMoeCudaCache) {
-            this->ApplyMoeDeviceMapForLayer(deviceLayer);
+        if (!useMoeCudaCache && !moeDevice.empty()) {
+            ApplyDeviceMap({{moeDevice, 1}}, 1, 1);
         }
 
         Data routed;
@@ -8837,7 +8972,10 @@ namespace fastllm {
             (hiddenStates.dims[1] == 1 || mtpTargetGraph) &&
             !this->weights.empty() && !this->weights[0].empty() &&
             MoeCudaCacheAvailable(this->weights[0]);
-        const bool hybridDenseGraph = tpHostMoe &&
+        const bool hybridMoe = !tpHostMoe &&
+            !this->weights.empty() && !this->weights[0].empty() &&
+            FastllmCudaUseMoeHybrid(this->weights[0].data(), this->weights[0].size());
+        const bool hybridDenseGraph = (tpHostMoe || hybridMoe) &&
             hiddenStates.dims.size() == 3 && hiddenStates.dims[1] == 1 &&
             verificationCapture == nullptr && Qwen4MtpDraftsPerStep() == 0;
         const bool moeDeviceMapGraphCompatible =
@@ -8849,9 +8987,6 @@ namespace fastllm {
             hybridDenseGraph;
         // Host decisions and NUMA execution cannot be captured in the full
         // backbone graph, including multi-row MTP verification.
-        const bool hybridMoe = !tpHostMoe &&
-            !this->weights.empty() && !this->weights[0].empty() &&
-            FastllmCudaUseMoeHybrid(this->weights[0].data(), this->weights[0].size());
         if (!GetFastllmEnv().cudaGraph ||
             (hybridMoe && !hybridDenseGraph) ||
             (hybridDenseGraph && !startBeforeAttention) ||
@@ -11877,6 +12012,28 @@ namespace fastllm {
 #endif
             requestState->borrowedPrefixSnapshot.reset();
         }
+        // Row selection depends only on tokens, so issue before embedding and
+        // layer 0. The ticket owns its buffers; no request history is advanced
+        // until RunPLE consumes the result (including speculative forwards).
+        DiskEmbeddingRowReader::Ticket plePrefetch;
+        if (pleDiskReader && threadTpRank <= 0 && inputIds.dims[1] == 1 &&
+            this->pleLayer > 0 &&
+            ((hostInputTokens && !hostInputTokens->empty()) ||
+             (inputIds.dataDevice == DataDevice::CPU && inputIds.cpuData &&
+              (inputIds.dataType == DataType::FLOAT32 || inputIds.dataType == DataType::FLOAT16)))) {
+            const int token = hostInputTokens && !hostInputTokens->empty()
+                ? (*hostInputTokens)[0]
+                : (int)((inputIds.dataType == DataType::FLOAT32
+                    ? reinterpret_cast<const float *>(inputIds.cpuData)[0]
+                    : half_to_float(reinterpret_cast<const uint16_t *>(inputIds.cpuData)[0])) + 0.01f);
+            const int shifted[3] = {token,
+                requestState->previousToken1 < 0 ? eosToken : requestState->previousToken1,
+                requestState->previousToken2 < 0 ? eosToken : requestState->previousToken2};
+            std::vector<int32_t> rows(this->ngramHeads);
+            for (int head = 0; head < this->ngramHeads; ++head)
+                rows[head] = (int32_t)PLEHashRow(shifted, head);
+            plePrefetch = pleDiskReader->ReadAsync(rows);
+        }
         AcquireServingCache(pastKeyValues, *requestState, inputIds.dims[1]);
 
         Data embedding, hiddenBuffers[2];
@@ -12066,10 +12223,10 @@ namespace fastllm {
                 }
                 if (threadTpRank >= 0) {
                     RunThreadTpPLE(*hiddenStates, inputIds, *requestState, pleOutput,
-                                   hostInputTokens);
+                                   hostInputTokens, &plePrefetch);
                 } else {
                     RunPLE(*hiddenStates, inputIds, *requestState, pleOutput,
-                           hostInputTokens);
+                           hostInputTokens, &plePrefetch);
                 }
                 AddTo(*hiddenStates, pleOutput);
                 DumpTensorIfRequested("layer_" + std::to_string(layer) +
@@ -12701,6 +12858,30 @@ namespace fastllm {
             FastllmCudaSetDevice(item.first);
             ForceDeviceSync();
         }
+        // Keep only the pinned QSA capacity from the final warmup, not its
+        // history or GPU cache/graph allocations. Otherwise the first serving
+        // request allocates two pinned buffers per attention layer again.
+        // Each rank transfers at most one buffer pair per layer; consuming it
+        // below moves ownership into one request rather than retaining a copy.
+        std::vector<std::map<int, std::shared_ptr<QsaHostMirrorTransfer>>>
+            hostMirrors(targets.size());
+        for (size_t rank = 0; rank < targets.size(); ++rank) {
+            auto *model = targets[rank].first;
+            auto state = model->requestStates.find(&targets[rank].second->front().first);
+            if (state == model->requestStates.end()) continue;
+            auto retain = [&](RequestState &source) {
+                for (auto &item : source.indexerHostMirrorTransfers) {
+                    if (!item.second || item.second.use_count() != 1) continue;
+                    // All warmup devices were synchronized above, including
+                    // the streams that wrote these host mirrors.
+                    item.second->MarkDeviceSynchronized();
+                    item.second->Rollback(0);
+                    hostMirrors[rank].emplace(item.first, std::move(item.second));
+                }
+            };
+            retain(state->second);
+            if (state->second.mtpState) retain(state->second.mtpState->attentionState);
+        }
         ClearWarmupCache(warmupCache);
         const auto freeBytes = FastllmCudaGetFreeSizes();
         const auto deviceBytes = FastllmCudaGetTotalSizes();
@@ -12738,6 +12919,7 @@ namespace fastllm {
         std::vector<std::shared_ptr<ServingCache>> reservations;
         for (size_t rank = 0; rank < targets.size(); ++rank) {
             auto reserved = std::make_shared<ServingCache>();
+            reserved->qsaHostMirrors = std::move(hostMirrors[rank]);
             reserved->layers.resize(block_cnt);
             for (int layer = 0; layer < (int)shapes[rank].size(); ++layer) {
                 const bool linear = layer < block_cnt && IsLinearAttentionLayer(layer);
@@ -12955,6 +13137,9 @@ namespace fastllm {
             throw;
         }
         ClearWarmupCache(cache);
+#if defined(__GLIBC__)
+        if (threadTpState) malloc_trim(0);
+#endif
         std::printf("finish.\n");
     }
 

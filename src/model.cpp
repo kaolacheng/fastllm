@@ -531,6 +531,7 @@ namespace fastllm {
              model->model_type != "step3p5" &&
              model->model_type != "laguna" &&
              model->model_type != "minimax_m2" &&
+             model->model_type != "naive_n05_flash" &&
              model->model_type != "deepseek_v4" &&
              model->model_type != "deepseek_v41" &&
              model->model_struct != "qwen3_5") ||
@@ -2365,6 +2366,7 @@ namespace fastllm {
                dataType == DataType::FLOAT16 ||
                dataType == DataType::BFLOAT16 ||
                dataType == DataType::FP8_E4M3 ||
+               dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
                dataType == DataType::NVFP4;
     }
 
@@ -2429,10 +2431,12 @@ namespace fastllm {
     static void SetDiskWeightMeta(Data &weight, const SafeTensorItem &tensor,
                                   DataType targetDataType,
                                   SafeTensorItem *scaleTensor = nullptr,
-                                  WeightType weightType = WeightType::LINEAR) {
+                                  WeightType weightType = WeightType::LINEAR,
+                                  float globalScale = 1.0f) {
         DataType sourceDataType;
-        if (IsPackedFP4StorageDType(tensor.dtype) && targetDataType == DataType::NVFP4) {
-            sourceDataType = DataType::NVFP4;
+        const bool compactE4M3 = targetDataType == DataType::NVFP4_BLOCK_16_E4M3;
+        if (IsPackedFP4StorageDType(tensor.dtype) && (targetDataType == DataType::NVFP4 || compactE4M3)) {
+            sourceDataType = targetDataType;
         } else if (!GetSafeTensorSourceDataType(
                        tensor.dtype, sourceDataType)) {
             ErrorInFastLLM("Disk MoE only supports F32/F16/BF16/FP8/NVFP4 safetensors: " + weight.name + "\n");
@@ -2442,7 +2446,7 @@ namespace fastllm {
         }
         if (scaleTensor != nullptr &&
             !((sourceDataType == DataType::FP8_E4M3 && targetDataType == DataType::FP8_E4M3) ||
-              (sourceDataType == DataType::NVFP4 && targetDataType == DataType::NVFP4))) {
+              (sourceDataType == DataType::NVFP4 && targetDataType == DataType::NVFP4) || compactE4M3)) {
             ErrorInFastLLM("Disk MoE only supports scaled weights for FP8/NVFP4 expert tensors: " + weight.name + "\n");
         }
         ResetDiskWeightMeta(weight, targetDataType, weightType);
@@ -2474,7 +2478,7 @@ namespace fastllm {
                             "Disk MoE scaled tensor shape is too large: " + weight.name + "\n");
             int n = (int)n64;
             int m = (int)tensor.shape.back();
-            if (targetDataType == DataType::NVFP4) {
+            if (targetDataType == DataType::NVFP4 || compactE4M3) {
                 m *= 2;
             }
             int ns, ms, blockK, blockM;
@@ -2497,9 +2501,10 @@ namespace fastllm {
             }
             weight.blockK = blockK;
             weight.blockM = blockM;
-            if ((targetDataType == DataType::NVFP4 ||
-                 (targetDataType == DataType::FP8_E4M3 && weightType == WeightType::EMBEDDING)) &&
-                (scaleTensor->dtype == "F8_E8M0" || scaleTensor->dtype == "U8")) {
+            if (((targetDataType == DataType::NVFP4 ||
+                  (targetDataType == DataType::FP8_E4M3 && weightType == WeightType::EMBEDDING)) &&
+                 (scaleTensor->dtype == "F8_E8M0" || scaleTensor->dtype == "U8")) ||
+                (compactE4M3 && scaleTensor->dtype == "F8_E4M3")) {
                 if (isScalarScale) {
                     ErrorInFastLLM("Disk compact weights do not support scalar scale: " + weight.name + "\n");
                 }
@@ -2516,6 +2521,7 @@ namespace fastllm {
                 scalePart.isScalePart = true;
                 weight.diskWeightParts.push_back(scalePart);
                 weight.scales.clear();
+                if (compactE4M3) weight.scales.push_back(globalScale);
             } else {
                 AssertInFastLLM(scaleTensor->buffer != nullptr,
                                 "Disk MoE scaled tensor scale buffer is empty: " + weight.name + "\n");
@@ -3197,7 +3203,7 @@ namespace fastllm {
             {"qwen4exp", "qwen4_exp"},
             {"glm4_moe", "glm4_moe"}, // glm4_moe
             {"glm-dsa", "glm_moe_dsa"}, {"glm_moe_dsa", "glm_moe_dsa"}, // glm_moe_dsa
-            {"glm5next", "glm5_next"},
+            {"glm5next", "glm5_next"}, {"glm5-next", "glm5_next"},
             {"minimax_m2", "minimax_m2"}, // minimax_m2
             {"deepseek2", "deepseek_v2"}, {"deepseek_v2", "deepseek_v2"},  {"deepseek_v3", "deepseek_v2"} // deepseek_v2
         };
@@ -4221,6 +4227,9 @@ namespace fastllm {
             }
         }
         uint64_t totalLoadBytes = 0;
+        const char *glmMtp = std::getenv("FASTLLM_GLM5_NEXT_ENABLE_MTP");
+        const int loadedLayerCount = ggufMainLayerCount +
+            (arch == "glm5_next" && glmMtp && std::atoi(glmMtp) > 0 ? ggufMtpLayerCount : 0);
         for (int i = 0; i < readGGUFTasks.size(); i++) {
             if (model->model_struct == "qwen4_exp" &&
                 readGGUFTasks[i].name == "model.language_model.ple_embedding.weight") {
@@ -4239,7 +4248,7 @@ namespace fastllm {
                 continue;
             }
             std::string &weightName = readGGUFTasks[i].name;
-            if (IsGGUFTaskBeyondMainLayers(weightName, ggufMainLayerCount)) {
+            if (IsGGUFTaskBeyondMainLayers(weightName, loadedLayerCount)) {
                 continue;
             }
             tensors.push_back(weightName);
@@ -4378,6 +4387,11 @@ namespace fastllm {
             if (loadTensors.empty()) {
                 return;
             }
+            // Resolve stable element addresses before workers mutate the map
+            // through weight merging. Importing distinct tensors stays parallel.
+            std::vector<Data *> loadWeights;
+            loadWeights.reserve(loadTensors.size());
+            for (const auto &name : loadTensors) loadWeights.push_back(&model->weight.weight.at(name));
             const int workers = std::min(threadNum, (int)loadTensors.size());
             std::vector<std::thread> threads;
             for (int worker = 0; worker < workers; worker++) {
@@ -4412,13 +4426,13 @@ namespace fastllm {
                             } else {
                                 tensor->CreateBuffer(task.sourceDataType);
                             }
-                            model->weight[weightName].CreateFromOriData(
+                            loadWeights[i]->CreateFromOriData(
                                 WeightType::AUTO, task.sourceDataType,
                                 tensor->buffer,
                                 tensor->minsBuffer, tensor->scalesBuffer,
                                 -1, tensor->blockK, tensor->blockM);
                             if (task.linear) {
-                                model->weight[weightName].CalcWeightSum();
+                                loadWeights[i]->CalcWeightSum();
                             }
                             tensor->ClearBuffer();
                             if (task.scale != nullptr) {
@@ -4431,14 +4445,17 @@ namespace fastllm {
                             DataType dataType = task.second;
                             tensorBytes = tensor->bytes;
                             tensor->CreateBuffer(dataType);
-                            model->weight[weightName].CreateFromOriData(
+                            loadWeights[i]->CreateFromOriData(
                                 WeightType::AUTO, dataType, tensor->buffer,
                                 nullptr, nullptr, -1, -1, -1);
                             tensor->ClearBuffer();
                         }
                         {
-                            // try merge                                
-                            locker.lock();
+                            // Merging inserts/erases unordered_map nodes. Keep
+                            // lookups, callbacks and registration in this same
+                            // critical section; unlocking around merge corrupts
+                            // the map when multiple expert pairs finish together.
+                            std::lock_guard<std::mutex> weightGuard(locker);
                             allFinishNames.insert(weightName);
                             // 检查是否需要合并权重
                             bool needMerge = false;
@@ -4488,7 +4505,6 @@ namespace fastllm {
                                     continue;
                                 }
 
-                                locker.unlock();
                                 for (auto &it : rule.rules) {
                                     if (allWeightNames.find(it.inputs[0]) == allWeightNames.end()) {
                                         continue;
@@ -4580,10 +4596,8 @@ namespace fastllm {
 #ifdef USE_TFACC
                                         try {
                                             if (model->ShouldRegisterSpecialWeightForDeviceType(mergeName, "tfacc")) {
-                                                locker.lock();
                                                 mergeData.weightSum.resize(1);
                                                 RegisterFastllmData(&mergeData, it.type);
-                                                locker.unlock();
                                             }
                                         } catch (...) {
                                         }
@@ -4600,26 +4614,20 @@ namespace fastllm {
                                         model->MoveSpecialWeightToCudaIfNeeded(mergeName, mergeData);
                                     }
 
-                                    locker.lock();
                                     allFinishNames.insert(mergedWeightName);
                                     model->OnWeightLoaded(mergedWeightName, allFinishNames);
-                                    locker.unlock();
                                     for (auto input : it.inputs) {
                                         model->weight.weight.erase(input);
                                     }
                                 }
-                                locker.lock();
                             }
-                            locker.unlock();
 #ifdef USE_TFACC
                             try {
                                 if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceType(weightName, "tfacc")) {
                                     auto weightIt = model->weight.weight.find(weightName);
                                     if (weightIt != model->weight.weight.end()) {
-                                        locker.lock();
                                         weightIt->second.weightSum.resize(1);
                                         RegisterFastllmData(&weightIt->second, model->specialWeights[weightName]);
-                                        locker.unlock();
                                     }
                                 }
                             } catch (...) {
@@ -5440,7 +5448,8 @@ namespace fastllm {
                                         if (tensor.dtype == "F8_E4M3") {
                                             diskDataType = DataType::FP8_E4M3;
                                         } else if (TryGetPackedFP4DataType(safeTensors, tensorName, packedFp4DataType)) {
-                                            diskDataType = packedFp4DataType;
+                                            diskDataType = packedFp4DataType == DataType::NVFP4_BLOCK_16 ?
+                                                DataType::NVFP4_BLOCK_16_E4M3 : packedFp4DataType;
                                         } else {
                                             ErrorInFastLLM("Disk MoE only supports scaled safetensors for FP8/NVFP4 expert weight: " + weightName + "\n");
                                         }
@@ -5459,8 +5468,23 @@ namespace fastllm {
                                             scaleTensor->CreateBuffer(DataType::FLOAT32);
                                         }
                                     }
+                                    float globalScale = 1.0f;
+                                    if (diskDataType == DataType::NVFP4_BLOCK_16_E4M3) {
+                                        const std::string name = FindSafeTensorScale2TensorName(safeTensors, tensorName);
+                                        if (!name.empty()) {
+                                            auto &scale2 = safeTensors.itmeDict.at(name);
+                                            scale2.CreateBuffer(DataType::FLOAT32);
+                                            AssertInFastLLM(scale2.len == 1, "Disk NVFP4 global scale must be scalar.");
+                                            globalScale = ((float*)scale2.buffer)[0];
+                                            if (StringEndWith(scale2.tensorName, ".weight_global_scale")) {
+                                                AssertInFastLLM(globalScale != 0, "Disk NVFP4 inverse scale is zero.");
+                                                globalScale = 1.0f / globalScale;
+                                            }
+                                            scale2.ClearBuffer();
+                                        }
+                                    }
                                     SetDiskWeightMeta(model->weight[weightName], tensor, diskDataType,
-                                                      scaleTensor, diskLazyWeightType);
+                                                      scaleTensor, diskLazyWeightType, globalScale);
                                     if (scaleTensor != nullptr) {
                                         scaleTensor->ClearBuffer();
                                     }

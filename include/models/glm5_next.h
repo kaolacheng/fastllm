@@ -14,8 +14,15 @@
 namespace fastllm {
     class CudaChunkedPrefillPipeline;
 
+    struct Glm5NextIndexerCheckpoint {
+        Data tailKeys, tailGates;
+        int tokens = 0;
+    };
+
     struct Glm5NextIndexerCache {
         Data keys, tailKeys, tailGates;
+        Data replayKeys, replayGates;
+        bool captureReplay = false;
         Data hadamard; // immutable workspace, not part of prefix snapshots
         Data pageTable; // derived GPU page map; rebuild after page/history changes
         std::vector<int> pageTableIds;
@@ -34,6 +41,12 @@ namespace fastllm {
         GetTensorMap(const std::vector<std::string> &tensorNames) override;
 
         void OnModelWeightsLoaded() override;
+        int GetWeightLoadPriority(const std::string &tensorName,
+                const std::vector<std::pair<std::string, DataType>> &mappedWeights) const override;
+        bool ShouldLoadWeightSeriallyBeforeOthers(const std::string &tensorName,
+                const std::vector<std::pair<std::string, DataType>> &mappedWeights) const override;
+        void OnWeightLoadGroupStarted(const std::set<std::string> &weightNames) override;
+        void OnWeightLoadGroupFinished() override;
 
         void SetDataType(DataType dataType) override;
 
@@ -50,6 +63,8 @@ namespace fastllm {
         bool UseGenericHistoryCache() const override { return false; }
 
         bool RetainCudaWorkspace() const override { return true; }
+
+        bool ShouldDelaySpecialWeightCudaMove(const std::string &) const override;
 
         int Forward(
                 const Data &inputIds,
@@ -92,6 +107,27 @@ namespace fastllm {
                 const std::string &output) override;
 
     private:
+        friend struct Glm5NextGGUFTestAccess;
+        struct ThreadTpState;
+        std::unique_ptr<ThreadTpState> threadTpState;
+        ThreadTpState *threadTpOwner = nullptr;
+        int threadTpRank = -1;
+        void InitThreadTp();
+        int ThreadTpExpertLayer(const std::string &name) const;
+        int StreamingThreadTpLayer(const std::string &name) const;
+        void StageThreadTpWeight(const std::string &name);
+        void PrepareThreadTp();
+        void ThreadTpAllReduce(Data &data);
+        void RemoveThreadTpRequest(const std::vector<std::pair<Data, Data>> *key);
+        struct KdaReplayCapture;
+        Data &OutputHead();
+        int ForwardThreadTp(const Data &inputIds,
+                std::vector<std::pair<Data, Data>> &pastKeyValues,
+                const GenerationConfig &generationConfig,
+                const LastTokensManager &lastTokens, std::vector<float> *logits,
+                bool sampleOutput = true, Data *targetHiddenStates = nullptr,
+                std::vector<KdaReplayCapture> *kdaReplay = nullptr);
+
         struct KdaReplayCapture {
             Data qProjected;
             Data kProjected;
@@ -106,6 +142,8 @@ namespace fastllm {
             std::vector<Data> kdaFirst;
             std::vector<Data> kdaSecond;
             std::vector<int> sparseLengths;
+            std::vector<Glm5NextIndexerCheckpoint> indexer;
+            std::vector<TargetRuntimeCheckpoint> ranks;
             bool ready = false;
         };
 
@@ -119,6 +157,8 @@ namespace fastllm {
             int targetTokensConsumed = 0;
             int activeDraftLimit = 0;
             int consecutiveFullAccepts = 0;
+            uint64_t verifiedDrafts = 0, acceptedDrafts = 0, verifySteps = 0;
+            uint64_t confidenceChecks = 0, confidenceStops = 0;
             bool disabled = false;
             TargetRuntimeCheckpoint targetCheckpoint;
             std::vector<KdaReplayCapture> kdaReplay;
@@ -185,13 +225,13 @@ namespace fastllm {
                 const std::vector<int> &inputTokens,
                 const std::vector<int> &positions,
                 Data *nextHiddenStates,
-                bool sampleToken);
+                bool sampleToken, float *topProbability = nullptr);
 
         void GenerateMtpProposalChain(
                 MtpRuntimeState &state,
                 const Data &targetHiddenStates,
                 const std::vector<int> &inputTokens,
-                const std::vector<int> &positions);
+                const std::vector<int> &positions, float minProbability = 0);
 
         void CaptureTargetRuntimeCheckpoint(
                 const std::vector<std::pair<Data, Data>> &pastKeyValues,
@@ -330,6 +370,7 @@ namespace fastllm {
         bool mtpEnabled = false;
         bool mtpWeightsReady = false;
         int mtpDraftsPerStep = 0;
+        float mtpMinProbability = 0;
         std::map<const std::vector<std::pair<Data, Data>> *,
                  std::shared_ptr<MtpRuntimeState>> mtpStates;
         std::mutex mtpStatesMutex;

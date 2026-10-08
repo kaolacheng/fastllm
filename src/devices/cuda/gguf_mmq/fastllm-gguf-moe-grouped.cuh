@@ -4,55 +4,11 @@
 
 #include "fastllm-gguf-moe-v41-mmq.cuh"
 
+#include "fastllm-gguf-mmq-q2.cuh"
+
 namespace grouped_moe {
 constexpr int kTile = 16;
 
-// Q2_0 stores four consecutive {-1,0,1,2} codes per byte, with one FP16
-// scale per 64 values. Expand only the current weight tile into MMA shared
-// memory. Guard the K tail: TP shards may have 320 columns, not 256*k.
-template<int Y, int Warps, bool Check>
-__device__ void LoadQ2(const char *x, int *tile, const int &kb0,
-                       const int &imax, const int &stride) {
-#ifdef INT8_MMA_AVAILABLE
-    constexpr int Pitch = MMQ_MMA_TILE_X_K_Q8_0;
-    auto *scales = reinterpret_cast<float *>(tile + 2*WARP_SIZE);
-    for (int row0 = 0; row0 < Y; row0 += Warps) {
-        const int row = row0 + threadIdx.y;
-        const int srcRow = Check ? min(row, imax) : row;
-        const auto *weight = reinterpret_cast<const block_q2_0 *>(x + srcRow*stride);
-        // One aligned 16-bit load supplies eight values. Decode both byte
-        // vectors in registers instead of issuing two dependent byte loads.
-        const int block = kb0 + threadIdx.x/8;
-        int2 values = make_int2(0, 0);
-        if (block < stride/int(sizeof(block_q2_0))) {
-            const uint16_t codes = reinterpret_cast<const uint16_t *>(
-                weight[block].qs)[threadIdx.x%8];
-            values = gguf_cache_q8::UnpackQ2(codes);
-        }
-        tile[row*Pitch + 2*threadIdx.x] = values.x;
-        tile[row*Pitch + 2*threadIdx.x+1] = values.y;
-        if (threadIdx.x < 8) {
-            const int block = kb0 + threadIdx.x/2;
-            scales[row*Pitch + threadIdx.x] = block < stride/int(sizeof(block_q2_0))
-                ? __half2float(weight[block].d) : 0.0f;
-        }
-    }
-#else
-    NO_DEVICE_CODE;
-#endif
-}
-} // namespace grouped_moe
-
-template<int X, int Y, int Warps, bool Check>
-struct mmq_type_traits<X, Y, Warps, Check, GGML_TYPE_Q2_0> {
-    static constexpr load_tiles_mmq_t load_tiles = grouped_moe::LoadQ2<Y, Warps, Check>;
-    static constexpr vec_dot_mmq_t vec_dot_mma =
-        vec_dot_q8_0_q8_1_mma<X, Y, Warps, MMQ_Q8_1_DS_LAYOUT_D4>;
-    // Admission requires NVIDIA SM75+, so the DP4A instantiation is unreachable.
-    static constexpr vec_dot_mmq_t vec_dot_dp4a = vec_dot_q8_0_q8_1_dp4a<X, Y, Warps>;
-};
-
-namespace grouped_moe {
 // MTP and TP shards can have a Q8_0 K dimension that ends inside a 256-value
 // MMA tile. The ordinary loader assumes complete tiles; zero the tail here.
 template<int Y, int Warps, bool Check>
@@ -97,7 +53,7 @@ static bool MatrixType(int type, int columns) {
 }
 static size_t Align(size_t x) { return (x+255)&~size_t(255); }
 struct Workspace {
-    int capacity, inputRows;
+    int capacity, inputRows, activeRows;
     int *counts, *offsets, *cursors, *tileExperts, *groupRoutes, *routeGroups;
     block_q8_1_mmq *quantized;
     float *products;
@@ -105,6 +61,7 @@ struct Workspace {
     Workspace(void *base, int rows, int hidden, int inter, int experts, int topk) : inputRows(rows) {
         const int routes = rows*topk;
         capacity = ((routes+experts*(kTile-1)+kTile-1)/kTile)*kTile;
+        activeRows = capacity;
         size_t used = 0;
         auto take = [&](size_t n) -> void * {
             void *p = base ? static_cast<char *>(base)+used : nullptr;
@@ -304,32 +261,31 @@ static void LaunchMatrix(const uint8_t *const *weights, int part, Workspace &w,
     std::call_once(initialized[device], [shared]() {
         CUDA_CHECK(cudaFuncSetAttribute(Matmul<Type, Tile>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared));
     });
-    Matmul<Type, Tile><<<dim3((width+get_mmq_y_host(cc)-1)/get_mmq_y_host(cc), w.capacity/kTile),
+    Matmul<Type, Tile><<<dim3((width+get_mmq_y_host(cc)-1)/get_mmq_y_host(cc), w.activeRows/kTile),
         dim3(32, MMQ_NWARPS), shared, stream>>>(weights, part, w.quantized, w.products,
             w.counts, w.offsets, w.tileExperts, experts, columns, width, w.capacity,
             int(ggml_row_size(Type, columns)));
 }
 static void Matrix(int type, const uint8_t *const *weights, int part, Workspace &w,
                     int experts, int columns, int width, cudaStream_t stream) {
+    // Short expert batches waste half of a 64-row tile on Turing. Use a
+    // narrower tile based on the routed batch, independent of model dimensions.
+    const bool compactTuring = w.inputRows >= 1024 &&
+        int64_t(w.activeRows) <= int64_t(experts) * 48 &&
+        ggml_cuda_info().devices[ggml_cuda_get_device()].cc == CC_TURING;
     switch (type) {
 #define GROUPED_CASE(T) case GGML_TYPE_##T: \
-        if (w.inputRows >= 1024) LaunchMatrix<GGML_TYPE_##T, 64>(weights, part, w, experts, columns, width, stream); \
+        if (compactTuring) LaunchMatrix<GGML_TYPE_##T, 32>(weights, part, w, experts, columns, width, stream); \
+        else if (w.inputRows >= 1024) LaunchMatrix<GGML_TYPE_##T, 64>(weights, part, w, experts, columns, width, stream); \
         else LaunchMatrix<GGML_TYPE_##T>(weights, part, w, experts, columns, width, stream); break;
         GROUPED_CASE(Q2_0) GROUPED_CASE(IQ2_XXS) GROUPED_CASE(IQ2_XS) GROUPED_CASE(IQ2_S)
         GROUPED_CASE(IQ3_XXS) GROUPED_CASE(IQ3_S) GROUPED_CASE(IQ4_NL) GROUPED_CASE(IQ4_XS)
-        GROUPED_CASE(Q8_0) GROUPED_CASE(Q2_K) GROUPED_CASE(Q4_K)
+        GROUPED_CASE(Q8_0) GROUPED_CASE(Q2_K) GROUPED_CASE(Q3_K) GROUPED_CASE(Q4_K)
 #undef GROUPED_CASE
     }
 }
-#include "fastllm-gguf-moe-v41.cuh"
-template<class T>
-static bool Run(const T *input, T *gate, T *output, const uint8_t *const *weights,
-                 const int *indices, const float *scores, void *workspace,
-                 int gt, int dt, int rows, int hidden, int inter, int experts, int topk,
-                 bool deepSeekV41, float swigluLimit, cudaEvent_t downWeightsReady) {
-    const auto stream = cudaStreamPerThread;
-    Workspace w(workspace, rows, hidden, inter, experts, topk);
-    const int routes = rows*topk;
+static void PrepareRoutes(const uint8_t *const *weights, const int *indices,
+                          Workspace &w, int routes, int experts, cudaStream_t stream) {
     CUDA_CHECK(cudaMemsetAsync(w.counts, 0, experts*sizeof(int), stream));
     CUDA_CHECK(cudaMemsetAsync(w.cursors, 0, experts*sizeof(int), stream));
     CUDA_CHECK(cudaMemsetAsync(w.groupRoutes, 0xff, w.capacity*sizeof(int), stream));
@@ -339,6 +295,18 @@ static bool Run(const T *input, T *gate, T *output, const uint8_t *const *weight
     Prefix<<<1, threads, 0, stream>>>(w.counts, w.offsets, w.tileExperts, experts);
     Scatter<<<(routes+255)/256, 256, 0, stream>>>(indices, weights, w.offsets, w.cursors,
         w.groupRoutes, w.routeGroups, routes, experts);
+}
+#include "fastllm-gguf-moe-v41.cuh"
+#include "fastllm-gguf-moe-glm5.cuh"
+template<class T>
+static bool Run(const T *input, T *gate, T *output, const uint8_t *const *weights,
+                 const int *indices, const float *scores, void *workspace,
+                 int gt, int dt, int rows, int hidden, int inter, int experts, int topk,
+                 bool deepSeekV41, float swigluLimit, cudaEvent_t downWeightsReady) {
+    const auto stream = cudaStreamPerThread;
+    Workspace w(workspace, rows, hidden, inter, experts, topk);
+    const int routes = rows*topk;
+    PrepareRoutes(weights, indices, w, routes, experts, stream);
     if constexpr (std::is_same<T, __nv_bfloat16>::value) {
         if (deepSeekV41) {
             RunV41(input, gate, output, weights, indices, scores, w,
@@ -376,7 +344,6 @@ struct StreamedWorkspace {
     block_q8_1 *input;
     block_q8_1_mmq *quantized;
     float *products, *routes;
-    void *gate;
     size_t bytes;
     StreamedWorkspace(void *base, int rows, int hidden, int inter, int topk, int capacity) {
         size_t used = 0;
@@ -384,30 +351,43 @@ struct StreamedWorkspace {
             void *p = base ? static_cast<char *>(base) + used : nullptr;
             used += Align(n); return p;
         };
-        input = static_cast<block_q8_1 *>(take(size_t(rows) * (hidden / 32) * sizeof(block_q8_1)));
+        // GLM uses Q8_K with FP32 scale and 16-value sums; it is slightly
+        // larger than eight ordinary Q8_1 blocks. Reuse the same allocation.
+        input = static_cast<block_q8_1 *>(take(std::max(
+            size_t(rows) * (hidden / 32) * sizeof(block_q8_1),
+            size_t(rows) * (hidden / 256) * sizeof(block_q8_K))));
         quantized = static_cast<block_q8_1_mmq *>(take(size_t(capacity) *
             (((std::max(hidden, inter) + 255) / 256) * 2) * sizeof(block_q8_1_mmq)));
         products = static_cast<float *>(take(size_t(capacity) * std::max(2 * inter, hidden) * sizeof(float)));
-        gate = take(size_t(capacity) * inter * sizeof(float));
         routes = static_cast<float *>(take(size_t(rows) * topk * hidden * sizeof(float)));
         bytes = used;
     }
 };
 
+// Preserve the projection and activation rounding, then quantize the value
+// still in registers. Padding participates as zero in the same 32-value max.
 template<class T>
-__global__ void ActivateStreamed(const float *products, T *packed, T *gate,
-        const int *routes, int rows, int inter) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * inter) return;
-    const int row = i / inter, col = i % inter, route = routes[row];
+__global__ void ActivateQuantizeStreamed(const float *products,
+        block_q8_1_mmq *output, T *gate, const int *routes,
+        int inter, int capacity) {
+    const int row = blockIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= ((inter + 255) / 256) * 256) return;
+    const int route = routes[row];
     T value = mmq_io<T>::from_float(0);
-    if (route >= 0) {
+    if (route >= 0 && col < inter) {
         const float g = mmq_io<T>::to_float(mmq_io<T>::from_float(products[size_t(row) * 2 * inter + col]));
         const float u = mmq_io<T>::to_float(mmq_io<T>::from_float(products[size_t(row) * 2 * inter + inter + col]));
         value = mmq_io<T>::from_float(g / (1 + expf(-g)) * u);
         gate[size_t(route) * inter + col] = value;
     }
-    packed[i] = value;
+    const float x = mmq_io<T>::to_float(value);
+    float maximum = fabsf(x);
+#pragma unroll
+    for (int m = 16; m; m >>= 1) maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, m));
+    const float scale = maximum / 127.0f;
+    auto &q = output[size_t(col / 128) * capacity + row];
+    q.qs[col % 128] = maximum == 0 ? 0 : int8_t(roundf(x / scale));
+    if (col % 32 == 0) q.d4[(col % 128) / 32] = __half2float(__float2half_rn(scale));
 }
 
 template<class T>
@@ -433,10 +413,17 @@ __global__ void ReduceStreamed(const float *products, T *output,
     output[i] = mmq_io<T>::from_float(sum);
 }
 
+#include "fastllm-gguf-moe-glm5-stream.cuh"
+
 template<class T>
 static bool RunStreamed(StreamedMoePhase phase, const T *input, T *gate, T *output,
         void *workspace, int capacity, int rows, int hidden, int inter, int topk,
-        int gt, int dt, const StreamedMoeBatch &batch, const float *scores) {
+        int gt, int dt, const StreamedMoeBatch &batch, const float *scores,
+        bool glm5, float swigluLimit, const int32_t *indices) {
+    if constexpr (std::is_same<T, __nv_bfloat16>::value) {
+        if (glm5) return RunGlm5Streamed(phase, input, gate, output, workspace,
+            capacity, rows, hidden, inter, topk, gt, dt, batch, scores, indices, swigluLimit);
+    }
     const auto stream = cudaStreamPerThread;
     StreamedWorkspace s(workspace, rows, hidden, inter, topk, capacity);
     if (phase == StreamedMoePhase::Prepare) {
@@ -447,17 +434,15 @@ static bool RunStreamed(StreamedMoePhase phase, const T *input, T *gate, T *outp
         ReduceStreamed<<<(rows * hidden + 255) / 256, 256, 0, stream>>>(s.routes, output, scores, rows, hidden, topk);
     } else {
         Workspace w(nullptr, rows, hidden, inter, batch.experts, topk);
-        w.capacity = capacity;
+        w.capacity = capacity; w.activeRows = batch.rows;
         w.counts = const_cast<int *>(batch.counts); w.offsets = const_cast<int *>(batch.offsets);
         w.tileExperts = const_cast<int *>(batch.tileExperts); w.groupRoutes = const_cast<int *>(batch.routes);
         w.quantized = s.quantized; w.products = s.products;
         GatherQuantized<<<dim3((batch.rows + 7) / 8, ((hidden + 255) / 256) * 2), 256, 0, stream>>>(
             s.input, s.quantized, batch.routes, batch.offsets + batch.experts, hidden, capacity, topk);
         Matrix(gt, batch.weights, 0, w, batch.experts, hidden, 2 * inter, stream);
-        ActivateStreamed<<<(batch.rows * inter + 255) / 256, 256, 0, stream>>>(
-            s.products, static_cast<T *>(s.gate), gate, batch.routes, batch.rows, inter);
-        Quantize<<<dim3((inter + 255) / 256, batch.rows), 256, 0, stream>>>(
-            static_cast<const T *>(s.gate), s.quantized, nullptr, batch.offsets + batch.experts, inter, capacity);
+        ActivateQuantizeStreamed<<<dim3((inter + 255) / 256, batch.rows), 256, 0, stream>>>(
+            s.products, s.quantized, gate, batch.routes, inter, capacity);
         Matrix(dt, batch.weights, 1, w, batch.experts, inter, hidden, stream);
         ScatterStreamed<T><<<(batch.rows * hidden + 255) / 256, 256, 0, stream>>>(
             s.products, s.routes, batch.routes, batch.rows, hidden);

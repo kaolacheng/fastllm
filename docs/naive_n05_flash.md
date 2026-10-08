@@ -1500,3 +1500,114 @@ decode 专家仍在 CPU，本轮优化针对长 prefill。
 模型测速覆盖的是 `cudapp=2` 配置。
 逐次数据、分层分配计数与校验结果见
 [多卡专家并行实测 JSON](benchmarks/naive_n05_flash_prefill_multigpu.json)。
+
+## TP 候选输出与小批 MoE
+
+普通 TP 解码和 DSpark verify 会自动在每卡选择局部候选，在 CPU 合并全局候选，
+减少完整词表的回传。Greedy 保留原 CUDA Top1 的并列分数顺序；有限 Top-k 采样按
+分数降序、token ID 升序。普通采样在选择前缩放温度，DSpark 使用原始分数选择，
+随后沿用原概率构造、接受/拒绝采样及 KV 提交规则。
+
+紧凑采样支持 K=2..64、每卡词表不超过 262144、全局词表不超过 2^24；这些是算子
+工作区和 FP32 token ID 格式的边界，不依赖 RTX 5090、TP8 或固定模型词表。
+Greedy 不受上述每卡词表大小限制。要求完整 logits、重复惩罚、最短输出长度、
+词表约束或超出紧凑算子边界时，保留原完整 logits 路径。普通串行推理沿用原实现。
+Graph 复用同时校验候选模式、K、温度缩放以及已有的缓存地址/容量和通信 generation。
+
+BF16/NVFP4 小批 MoE 对 2..8 行、top-k<=16 按专家稳定分组，保留原 route ID 和
+每个 token 的加权累加顺序。每个输出 tile 在一个 CTA 内完成 K 归约，避免后续行
+的路由选择改变已有前缀结果。与逐行计算比较使用既有数值容差；相同路径的 eager、
+Graph replay 和后缀路由变化下的前缀比较仍要求逐 bit 一致。其他数据类型和尺寸
+继续走已有调度，跨设备 scratch 迁移也保留。
+
+这些路径没有额外环境开关。`FASTLLM_TP`、`FASTLLM_DSPARK_TOKENS` 和
+`FASTLLM_DSPARK_CONFIDENCE_THRESHOLD` 是现有 CLI 的有效配置接口，继续保留。
+
+启用 `UNIT_TEST` 和 `USE_CUDA` 后，相关 CTest 为 `naive_n05_logits`、
+`naive_n05_verify_selection_{2,4,8}`、`naive_n05_verify_selection_graph`（Linux）、
+`naive_n05_tp_graph`（Linux）、`cuda_nvfp4_marlin_grouped_rows` 和
+`cuda_nvfp4_marlin_cross_device_rows`。`speculative_sampling` 还覆盖 CPU 概率与残差采样。
+
+
+## 草稿投影融合与独立 TP
+
+草稿 Q/K/V 与 Gate/Up 在模型加载阶段分别合并，沿用 WeightMergeRule 的所有权规则，
+合并成功后删除原条目。上下文 K/V 从合并 QKV 建立只读行视图，不另存合并权重缓存。
+BF16 草稿支持 Q/K RMSNorm、RoPE 和 KV 写入融合；SwiGLU 保留先将 SiLU 舍入为
+BF16 再相乘的数值语义。布局不满足融合条件时保留原算子路径，Graph 和 eager 均可运行。
+
+草稿并行只使用一个配置项 `FASTLLM_DSPARK_TP`：
+
+| 值 | 执行方式 |
+|---|---|
+| 不设置或 `1` | 单卡草稿，兼容原默认行为 |
+| `2`、`4` 等整数 N | QKV/Attention/O 与 MLP 均按 N 卡切分 |
+| `mlp:2`、`mlp:4` 等 `mlp:N` | 每卡计算完整 Attention 并持有完整 KV，只有 MLP 切分 |
+
+配置在草稿第一次使用多卡时固定，不支持加载后切换。Target 已配置 TP 时，草稿采用其
+设备列表的前 N 张卡；否则从草稿当前设备开始，按可见 CUDA 设备编号补齐。不会把
+target/head 的并行度改成 N。上下文 FC 和 Markov proposal 继续在草稿首卡运行。
+仅 MLP TP 会产生计算所需的 Attention 副本；分片与副本都释放父投影的原始存储，
+不额外保留未分片大矩阵。
+
+并行实现按实际设备数量处理，不限定为双卡或四卡。N 不能超过可用设备数或 target TP
+设备数，MLP 中间维度必须能被 N 整除；完整 TP 还要求 Q/KV 头数能被 N 整除。
+仅 MLP TP 支持单 KV 头。当前路径要求 CUDA embedding、BF16 稠密投影、peer access，
+不支持 low-memory 模式；head_dim 为 4 的倍数且不超过 256，草稿 block 在 2..31 范围。
+不符合要求时明确报错，不在已分片权重上静默退回单卡。
+
+多卡上下文投影使用逐层 K/V 行视图和 batched GEMM；工作区只保留激活与小指针表，
+不缓存权重副本。草稿拥有独立通信组、持久工作线程和 Executor，不替换 target 的通信组。
+所有从卡提交完成后首卡才允许复用输入存储。Graph 捕获失败时统一释放各卡 graph 并回退
+到相同 TP 策略的 eager 路径。未为上下文更新新增 CUDA Graph。
+
+Linux CUDA CTest 中，`naive_n05_draft_fusion` 与 `naive_n05_draft_kv` 覆盖融合数值、
+布局拒绝、请求复用及跨窗口更新；`naive_n05_draft_tp_*`、`naive_n05_draft_mlp_tp_*`
+覆盖完整/仅 MLP TP、MQA、2/4/8 卡、Graph/eager、捕获失败回退和非零首卡。
+TP 改变 GEMM 与跨卡归约顺序，跨策略使用既有数值容差；同一策略 Graph/eager 要求逐位一致。
+
+并行度需要按实际硬件和请求评估。历史短请求中，优化完整 TP2 相对单卡有端到端收益；
+仅 MLP TP2 的一次对照整轮略快于完整 TP2，但收益主要体现在 Verify 时间变化，稳定性
+尚未确认；TP4 在该场景没有净收益。因此不自动提高草稿并行度，也不承诺线性加速。
+
+
+## 普通 TP 解码合批
+
+未配置 DSpark 草稿模型时，Naive TP 支持服务端按 `--max_batch` 合并活跃请求。
+例如保留现有 TP8 启动参数，设置 `--max_batch 2 --mtp 0`，并移除
+`--speculative_algorithm`、`--draft` 等草稿参数。`--mtp 0` 本身不会关闭显式启用的 DSpark。
+
+多个请求共享一次 TP worker 派发，QKV、输出投影、路由、稠密 MLP 与词表投影按多行执行；
+Attention/Indexer 使用各请求独立的 KV、位置及长度。为保持普通解码的专家归约顺序，
+MoE 专家投影暂按请求执行，其余投影和层间通信仍按多行执行。权重沿用原有分片，不复制 KV
+或增加合并权重缓存。采样配置、最短输出限制与历史 token 仍按请求分别处理。
+当前服务调度器仍逐请求 prefill，再对活跃请求合批 decode；指针式 ForwardBatch
+也接受按请求顺序打包、无 padding 的变长输入。
+
+合批 Graph 状态与单请求 decode、DSpark verify 分开。满足已有 Graph 后端约束时，
+最多八个单 token 请求复用每卡一个 Graph；请求顺序、数量、KV 地址/容量、
+Attention 区间或候选选择配置改变时重新检查。更大 batch、prefill 和 Graph 捕获失败
+使用同一合批前向的 eager 路径。没有新增环境变量，融合和 Graph 仍遵循现有设置。
+
+本路径仅为普通 CUDA TP 开启合批能力。草稿解码和非 TP 模式仍使用现有单请求路径；
+它不是两个独立 GPU stream 同时跑两份模型。多行投影共享权重读取，具体吞吐收益
+取决于各请求的专家重合度、上下文长度与硬件，需要端到端测量。
+
+### TP 跨请求历史前缀复用
+
+Naive CUDA TP 支持 `--cache_history true`，普通解码、普通合批和 DSpark 共用已有的
+CPU 历史归档。按完整 token 前缀匹配，可复用重复、追加、缩短和中途分叉的请求。
+SWA 归档保留已移出活动窗口的历史行，DSA 包含 index key，DSpark 同时保存已提交
+hidden features；未接受的草稿以及结束/取消后未发出的后缀不会作为命中前缀发布。
+
+归档只保存一份逻辑 KV；TP 恢复时重新分片，并向共享 KV 头的 rank 复制对应头。
+请求创建仅恢复私有 CPU 状态，首次前向由各 rank 并行上传 CUDA，避免与其他请求的前向工作区竞争。
+单个存活请求可复用上一请求的空闲 GPU 分配，恢复内容后再执行；有其他存活请求时不转移 KV 所有权。
+Graph replay 完成后记录新行，每卡批量暂存后统一下载，不将 CPU 下载放入 Graph 捕获，保留已有融合路径。
+需要单 token target 前向并收集草稿 hidden states 时，也可使用单行 Graph；
+恢复完草稿上下文后直接开始推测的请求继续走原有 Verify Graph。
+缓存沿用每记录 8 GiB、最多 5 条已完成记录的限制，不新增配置环境变量。
+`--prefix_cache` 的通用 paged-cache 开关不代替这个模型的 `--cache_history`。
+
+历史归档及恢复包含 CPU/GPU 传输，有固定开销；命中 token 数不等于端到端收益。
+短前缀可能不比重新 prefill 更快，应按实际上下文和命中率测量首 token 延迟及生成速度。

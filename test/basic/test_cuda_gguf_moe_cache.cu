@@ -7,7 +7,10 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include "../../src/devices/cuda/moe/fastllm-moe-gguf-restore.cuh"
+#include "../../src/devices/cuda/fastllm-gguf-mmvq-dispatch.cuh"
+#include "cuda_delayed_down_upload.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -284,9 +287,66 @@ template<class T> static void Run(ggml_type type, fastllm::DataType dtype, int b
     Require(fastllm_moe_cuda_cache_stats(0, stats, false) && stats[2] == 0, "released GPU allocation counted");
     std::printf("PASS GGUF cache type=%d dtype=%d batch=%d: mixed layers, snapshot, cold/hot, eviction, duplicate/invalid routes, graph, release\n", type, dtype, batch);
 }
-// Validate the FP32 prefill entry against CPU-decoded weights and an
-// independent Q8 activation oracle. These formats all use MMQ's D4 layout.
-static void RunFloatMmq(ggml_type type, int batch, int columns, int width) {
+// Validate FP32 MMQ/MMVQ against CPU-decoded weights and an independent Q8
+// activation oracle. Exact activations also cover the FP16 metadata layouts.
+// Call the declaration-only MMVQ interface with its original default template
+// arguments. This catches missing explicit instantiations after CUDA splitting
+// and keeps the multi-matrix/indirect-expert path covered by a CPU oracle.
+static void RunLegacyMmvqDispatch() {
+    constexpr int columns = 256, width = 47, matrices = 2;
+    auto weight = Weight(GGML_TYPE_Q5_0, matrices * width, columns, 5, true);
+    const auto decoded = Decode(*weight);
+    weight->ToDevice(fastllm::CUDA, {0}, true);
+    const int previous = fastllm::FastllmCudaGetLinearExactBatchThreshold();
+    for (int batch = 1; batch <= 8; ++batch) {
+        std::vector<block_q8_1> input(matrices * batch * (columns / QK8_1));
+        for (size_t b = 0; b < input.size(); ++b) {
+            auto &q = input[b];
+            q.d = __half_as_ushort(__float2half_rn(1.0f / 64));
+            int sum = 0;
+            for (int j = 0; j < QK8_1; ++j) {
+                q.qs[j] = int((b * 13 + j * 7) % 63) - 31;
+                sum += q.qs[j];
+            }
+            q.s = __half_as_ushort(__float2half_rn(sum / 64.0f));
+        }
+        fastllm::Data x(fastllm::FLOAT32, {int(input.size() * sizeof(block_q8_1) / sizeof(float))});
+        fastllm::Data y(fastllm::FLOAT32, {matrices, batch, width}), ids(fastllm::INT32, {matrices});
+        Gpu(x); Gpu(y); Gpu(ids);
+        const int selected[] = {1, 0};
+        Cuda(cudaMemcpy(x.cudaData, input.data(), input.size() * sizeof(block_q8_1), cudaMemcpyHostToDevice));
+        Cuda(cudaMemcpy(ids.cudaData, selected, sizeof(selected), cudaMemcpyHostToDevice));
+        for (int groups : {1, matrices}) for (int threshold : {0, 9}) {
+            fastllm::FastllmCudaSetLinearExactBatchThreshold(threshold);
+            mul_mat_vec_q_cuda<GGML_TYPE_Q5_0, float>(
+                weight->cudaData, x.cudaData, static_cast<float *>(y.cudaData),
+                groups == 1 ? nullptr : static_cast<const char *>(ids.cudaData),
+                columns, width, columns, batch, width, groups,
+                width * ggml_row_size(GGML_TYPE_Q5_0, columns),
+                batch * (columns / QK8_1) * sizeof(block_q8_1),
+                batch * width * sizeof(float), sizeof(int), cudaStreamPerThread);
+            Cuda(cudaGetLastError());
+            std::vector<float> actual(groups * batch * width);
+            Cuda(cudaMemcpy(actual.data(), y.cudaData, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            for (int g = 0; g < groups; ++g) for (int t = 0; t < batch; ++t) for (int row = 0; row < width; ++row) {
+                const int expert = groups == 1 ? 0 : selected[g];
+                double reference = 0, magnitude = 0;
+                for (int c = 0; c < columns; ++c) {
+                    const auto &q = input[(g * batch + t) * (columns / QK8_1) + c / QK8_1];
+                    const double term = decoded[(expert * width + row) * columns + c] *
+                        (double(q.qs[c % QK8_1]) / 64);
+                    reference += term; magnitude += std::fabs(term);
+                }
+                Require(std::fabs(actual[(g * batch + t) * width + row] - reference) <=
+                        2e-5 * std::max(1.0, magnitude), "legacy MMVQ dispatch disagrees with CPU oracle");
+            }
+        }
+    }
+    fastllm::FastllmCudaSetLinearExactBatchThreshold(previous);
+}
+
+static void RunFloatGgufMatmul(ggml_type type, int batch, int columns, int width, bool exactActivation = false) {
+    const auto matmul = batch <= 8 ? FastllmCudaFloatMatMulGGUFMMVQ : FastllmCudaFloatMatMulGGUFMMQ;
     auto weight = Weight(type, width, columns, 5, true);
     const auto decoded = Decode(*weight);
     weight->ToDevice(fastllm::CUDA, {0}, true);
@@ -294,8 +354,13 @@ static void RunFloatMmq(ggml_type type, int batch, int columns, int width) {
     fastllm::Data output(fastllm::FLOAT32, {batch, width});
     Gpu(input); Gpu(output);
     std::vector<float> values(batch*columns), quantized(batch*columns);
-    for (int i = 0; i < batch*columns; ++i)
-        values[i] = i%columns < 32 ? 0 : .37f*std::sin(i*.173f)+.013f*std::cos(i*.71f);
+    for (int i = 0; i < batch*columns; ++i) {
+        // Exact Q8 values also cover formats with FP16 scale/sum metadata or
+        // 64-value scales without making the CPU oracle depend on MMQ layout.
+        values[i] = exactActivation ? (i%32 == 31 ? 127 : (i*17)%255-127)/64.0f
+                                   : .37f*std::sin(i*.173f)+.013f*std::cos(i*.71f);
+        if (i%columns < 32) values[i] = 0;
+    }
     for (int i = 0; i < batch*columns; i += 32) {
         float maximum = 0;
         for (int c = 0; c < 32; ++c) maximum = std::max(maximum, std::fabs(values[i+c]));
@@ -306,10 +371,10 @@ static void RunFloatMmq(ggml_type type, int batch, int columns, int width) {
     Cuda(cudaMemcpy(input.cudaData, values.data(), values.size()*sizeof(float), cudaMemcpyHostToDevice));
     Require(!FastllmCudaFloatMatMulGGUFMMQ(input.cudaData, weight->cudaData, output.cudaData,
         type, 1, columns, width, cudaStreamPerThread), "MMQ stole single-token decode");
-    Require(!FastllmCudaFloatMatMulGGUFMMQ(input.cudaData, weight->cudaData, output.cudaData,
-        type, batch, columns-1, width, cudaStreamPerThread), "MMQ accepted a partial weight block");
-    Require(FastllmCudaFloatMatMulGGUFMMQ(input.cudaData, weight->cudaData, output.cudaData,
-        type, batch, columns, width, cudaStreamPerThread), "FP32 MMQ rejected valid prefill");
+    Require(!matmul(input.cudaData, weight->cudaData, output.cudaData,
+        type, batch, columns-1, width, cudaStreamPerThread), "MMQ/MMVQ accepted a partial weight block");
+    Require(matmul(input.cudaData, weight->cudaData, output.cudaData,
+        type, batch, columns, width, cudaStreamPerThread), "FP32 MMQ/MMVQ rejected valid input");
     Cuda(cudaStreamSynchronize(cudaStreamPerThread));
     std::vector<float> actual(batch*width);
     Cuda(cudaMemcpy(actual.data(), output.cudaData, actual.size()*sizeof(float), cudaMemcpyDeviceToHost));
@@ -321,16 +386,16 @@ static void RunFloatMmq(ggml_type type, int batch, int columns, int width) {
         }
         Require(std::isfinite(actual[row*width+col]) &&
             std::fabs(actual[row*width+col]-reference) <= 2e-5*std::max(1.0, magnitude),
-            "FP32 MMQ disagrees with CPU decoded Q8 dot");
+            "FP32 MMQ/MMVQ disagrees with CPU decoded Q8 dot");
     }
     Require(FastllmCudaMatMulFloatGGUF(input, *weight, fastllm::Data(), output,
-        batch, columns, width), "FP32 GGUF Linear rejected prefill");
+        batch, columns, width), "FP32 GGUF Linear rejected input");
     Cuda(cudaStreamSynchronize(cudaStreamPerThread));
     std::vector<float> dispatched(actual.size());
     Cuda(cudaMemcpy(dispatched.data(), output.cudaData, dispatched.size()*sizeof(float), cudaMemcpyDeviceToHost));
     for (size_t i = 0; i < actual.size(); ++i)
         Require(std::fabs(actual[i]-dispatched[i]) <= 1e-6f*std::max(1.0f,std::fabs(actual[i])),
-                "FP32 GGUF Linear bypassed MMQ");
+                "FP32 GGUF Linear bypassed MMQ/MMVQ");
 }
 
 // Reusing Q8 input must preserve the independent-call results exactly, even
@@ -387,6 +452,66 @@ template<class T> static void RunReusedInput(ggml_type type, fastllm::DataType d
         previous = actual;
     }
     std::printf("PASS reused Q8 input type=%d dtype=%d: exact results, changed tokens, independent scratch\n", type, dtype);
+}
+
+template<class T> static void RunSplitUpload(ggml_type type, fastllm::DataType dtype, bool numa) {
+    using namespace fastllm;
+    constexpr int hidden = 2560, inter = 640;
+    auto g = Weight(type, 2*inter, hidden, 1, true);
+    auto d = Weight(GGML_TYPE_Q2_0, hidden, inter, 2, true);
+    int gateType = -1, downType = -1;
+    if (numa) {
+        const size_t rowBytes = g->GetBytes()/(2*inter);
+        const std::vector<uint8_t> canonical(g->cpuData, g->cpuData + g->GetBytes());
+        for (int r = 0; r < 2*inter; ++r)
+            std::memcpy(g->cpuData + r*rowBytes, canonical.data() + (r/2 + (r%2)*inter)*rowBytes, rowBytes);
+        g->Repack(); d->Repack(); gateType = g->ggmlType; downType = d->ggmlType;
+    }
+    const size_t offset = (g->GetBytes()+15)/16*16, stride = offset+d->GetBytes();
+    const size_t bytes = FastllmCudaMoeGGUFCacheWorkspaceBytes(hidden, inter);
+    Data records(INT8, {int(stride)}), workspace(INT8, {int(bytes)});
+    Data input(dtype, {1,hidden}), gate(dtype, {1,inter}), output(dtype, {1,hidden});
+    Data slots(INT32, {1}), scores(FLOAT32, {1}), partial(FLOAT32, {1,hidden});
+    for (auto *v : {&records,&workspace,&input,&gate,&output,&slots,&scores,&partial}) Gpu(*v);
+    Cuda(cudaMemset(slots.cudaData,0,sizeof(int32_t)));
+    const float score = 1; Cuda(cudaMemcpy(scores.cudaData,&score,sizeof(score),cudaMemcpyHostToDevice));
+    fastllm_test::DelayedDownUpload upload(stride);
+    std::memcpy(upload.host,g->cpuData,g->GetBytes());
+    std::memcpy(upload.host+offset,d->cpuData,d->GetBytes());
+    FastllmCudaMoeGGUFCacheView view{static_cast<uint8_t *>(records.cudaData),
+        static_cast<int32_t *>(slots.cudaData),stride,offset,type,GGML_TYPE_Q2_0,hidden,inter,
+        workspace.cudaData,bytes};
+    view.numaGateType = gateType; view.numaDownType = downType;
+    std::vector<T> x(hidden);
+    std::vector<float> reference(hidden),actual(hidden);
+    for (int pass = 0; pass < 3; ++pass) {
+        for (int i = 0; i < hidden; ++i) x[i] = Cast<T>(.03f*std::sin(i*.731f+pass));
+        Cuda(cudaMemcpy(input.cudaData,x.data(),x.size()*sizeof(T),cudaMemcpyHostToDevice));
+        Cuda(cudaMemcpy(records.cudaData,upload.host,stride,cudaMemcpyHostToDevice));
+        Require(FastllmCudaMoeGGUFCacheCompute(input,gate,output,view,
+            static_cast<float *>(scores.cudaData),1,static_cast<float *>(partial.cudaData)),"split reference rejected");
+        Cuda(cudaMemcpy(reference.data(),partial.cudaData,hidden*sizeof(float),cudaMemcpyDeviceToHost));
+        Cuda(cudaMemset(records.cudaData,0xff,stride));
+        Cuda(cudaDeviceSynchronize());
+        Cuda(cudaMemcpyAsync(records.cudaData,upload.host,offset,cudaMemcpyHostToDevice,upload.stream));
+        Cuda(cudaEventRecord(upload.gateReady,upload.stream));
+        upload.Hold();
+        Cuda(cudaMemcpyAsync(static_cast<uint8_t *>(records.cudaData)+offset,upload.host+offset,
+            stride-offset,cudaMemcpyHostToDevice,upload.stream));
+        Cuda(cudaEventRecord(upload.downReady,upload.stream));
+        Cuda(cudaStreamWaitEvent(cudaStreamPerThread,upload.gateReady,0));
+        Require(FastllmCudaMoeGGUFCacheComputeStaged(input,gate,output,view,
+            static_cast<float *>(scores.cudaData),1,static_cast<float *>(partial.cudaData),
+            {upload.downReady,upload.gateDone,upload.downStart}),"split upload rejected");
+        Cuda(cudaEventSynchronize(upload.gateDone));
+        const bool earlyGate = !upload.timedOut && cudaEventQuery(upload.downReady) == cudaErrorNotReady;
+        upload.release = true;
+        Cuda(cudaMemcpy(actual.data(),partial.cudaData,hidden*sizeof(float),cudaMemcpyDeviceToHost));
+        Require(earlyGate,"gate waited for down upload");
+        Require(std::memcmp(actual.data(),reference.data(),hidden*sizeof(float))==0,"split upload changed output");
+        for (float v : actual) Require(std::isfinite(v),"split upload read poisoned weights");
+    }
+    std::printf("PASS split upload type=%d dtype=%d numa=%d: early gate, delayed down, bitwise output\n",type,dtype,int(numa));
 }
 
 // Compact dispatch must preserve the original input row and output route,
@@ -712,8 +837,8 @@ static void RunPrefillCached(int device) {
     Require(FastllmCudaMergeMOECache(row,gate,output,weights.data(),weights.size(),
         static_cast<int32_t *>(ids.cudaData),static_cast<float *>(scores.cudaData),topk), "prefill cache seed failed");
     Cuda(cudaStreamSynchronize(cudaStreamPerThread));
-    FastllmCudaMoeGGUFResidents resident;
-    Require(FastllmCudaGetMoeGGUFResidents(weights.data(),experts,resident), "prefill resident snapshot failed");
+    FastllmCudaMoePrefillResidents resident;
+    Require(FastllmCudaGetMoePrefillResidents(weights.data(),experts,resident), "prefill resident snapshot failed");
     Require(resident.weights[0] && resident.weights[4] && resident.weights[8] && !resident.weights[12],
         "prefill resident map differs from admitted experts");
     auto eraseHost = [&](int e) {
@@ -737,7 +862,7 @@ static void RunPrefillCached(int device) {
     check();
     Require(fastllm_moe_cuda_cache_stats(device,after,false) && std::equal(before,before+5,after),
         "prefill mutated decode cache statistics");
-    Require(FastllmCudaGetMoeGGUFResidents(weights.data(),experts,resident) && resident.weights[12],
+    Require(FastllmCudaGetMoePrefillResidents(weights.data(),experts,resident) && resident.weights[12],
         "prefill miss was not retained in cache");
     eraseHost(6);
     Require(FastllmCudaMergeMOEGGUFHost(input,gate,scratch,output,weights.data(),experts,
@@ -748,7 +873,7 @@ static void RunPrefillCached(int device) {
     for (int i = 0; i < rows*topk; ++i) routes[i] = i % experts;
     Require(FastllmCudaMergeMOEGGUFHost(input,gate,scratch,output,weights.data(),experts,
         routes.data(),scale.data(),topk,all,false), "bulk cached prefill rejected");
-    Require(FastllmCudaGetMoeGGUFResidents(weights.data(),experts,resident), "bulk cache disappeared");
+    Require(FastllmCudaGetMoePrefillResidents(weights.data(),experts,resident), "bulk cache disappeared");
     int filled = 0;
     for (int e = 0; e < experts; ++e) if (resident.weights[2*e]) {
         ++filled;
@@ -759,7 +884,7 @@ static void RunPrefillCached(int device) {
         routes.data(),scale.data(),topk,all,false), "bulk cache reuse rejected");
     check();
     FastllmCudaReleaseMoeCache(weights.data(),weights.size()); SetMoeCudaCacheBytes(0);
-    Require(!FastllmCudaGetMoeGGUFResidents(weights.data(),experts,resident), "released prefill pointers survived");
+    Require(!FastllmCudaGetMoePrefillResidents(weights.data(),experts,resident), "released prefill pointers survived");
     std::printf("PASS cached prefill device=%d: resident+miss, bulk fill/reuse, CPU oracle, release\n",device);
 }
 
@@ -826,6 +951,13 @@ template<class T> static void RunHost(ggml_type type, fastllm::DataType dtype,
     Cuda(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
     Require(!launch(),"host uploads admitted during graph capture");
     Cuda(cudaStreamEndCapture(cudaStreamPerThread,&graph)); Cuda(cudaGraphDestroy(graph));
+    if (batch >= 1024) {
+        // Grow a previously used transfer/compute arena. The previous DMA
+        // must finish before its backing allocation can be released.
+        input.Resize({33, hidden});
+        Require(launch(), "host prefill growth warmup rejected");
+        input.Resize({batch, hidden});
+    }
     for (int pass = 0; pass < 3; ++pass) {
         selected = pass == 0 ? std::unordered_set<int>{1,3} :
             pass == 1 ? std::unordered_set<int>{2,4} : std::unordered_set<int>{1,2,3,4};
@@ -1120,6 +1252,16 @@ static void RunHybrid(ggml_type format, int rows, bool single = false, bool freq
             Require(submitted == 1 && overlapped == cpu,
                     "overlap changed CPU expert arithmetic or callback count");
             if (step == 0) {
+                double cpuUs = 0;
+                auto begin = std::chrono::steady_clock::now();
+                NumasMoeDecodeExpertsWithOverlap(x.data(), overlapped.data(), table.data(),
+                    route.data(), mask.data(), topk, layer,
+                    [] { std::this_thread::sleep_for(std::chrono::milliseconds(20)); },
+                    nullptr, 0.f, 32, &cpuUs);
+                const double wallUs = std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - begin).count();
+                Require(cpuUs > 0 && cpuUs < wallUs * .5 && overlapped == cpu,
+                        "unscored CPU timing included callback stall or changed arithmetic");
                 bool caught = false;
                 try {
                     NumasMoeDecodeExpertsWithOverlap(x.data(), overlapped.data(), table.data(),
@@ -1364,6 +1506,15 @@ int main(int argc, char **argv) {
     try {
         int count = 0; Cuda(cudaGetDeviceCount(&count)); if (!count) { std::puts("SKIP: no CUDA device"); return 0; }
         Cuda(cudaSetDevice(0));
+        if (argc > 1 && std::strcmp(argv[1], "--split-upload") == 0) {
+            for (auto type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_F16})
+                for (bool numa : {false,true}) {
+                    RunSplitUpload<float>(type,fastllm::FLOAT32,numa);
+                    RunSplitUpload<half>(type,fastllm::FLOAT16,numa);
+                    RunSplitUpload<__nv_bfloat16>(type,fastllm::BFLOAT16,numa);
+                }
+            std::puts("PASS: GGUF split upload dependencies"); return 0;
+        }
         if (argc > 1 && std::strcmp(argv[1], "--numa-layout") == 0) {
             // R4 requires the Q8 projection for each packed part. Some mixed
             // pairs switch to floating-point projection above 32 input rows.
@@ -1513,6 +1664,10 @@ int main(int argc, char **argv) {
             // and a partial final group, including negative/duplicate routes.
             RunHost<float>(GGML_TYPE_IQ3_XXS, fastllm::FLOAT32, 0, 65, 320, true, GGML_TYPE_IQ4_NL, 67);
             RunHost<half>(GGML_TYPE_IQ2_S, fastllm::FLOAT16, 0, 1024, 320, true, GGML_TYPE_IQ4_NL, 67);
+            // Many experts with few routed tokens selects 32-row prefill
+            // tiles. Check both FP32 and BF16 activation rounding and K tails.
+            RunHost<float>(GGML_TYPE_IQ3_S, fastllm::FLOAT32, 0, 1024, 320, true, GGML_TYPE_IQ4_NL, 127);
+            RunHost<__nv_bfloat16>(GGML_TYPE_IQ2_S, fastllm::BFLOAT16, 0, 1024, 320, true, GGML_TYPE_Q2_0, 127);
             RunPrefillCached(0);
             if (count >= 2) RunPrefillCached(1);
             std::puts("PASS: streamed GGUF prefill, NUMA shards, selected subsets, immutable weights");
@@ -1529,14 +1684,32 @@ int main(int argc, char **argv) {
             if (properties.major*10+properties.minor < 75) {
                 std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: MMQ requires SM75+"); return 0;
             }
+            RunLegacyMmvqDispatch();
+            // Exercise the separately compiled MMVQ kernels, especially the
+            // IQ1 table initialization, against the CPU oracle on first use.
+            for (auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M})
+                for (int batch = 1; batch <= 8; ++batch)
+                    RunFloatGgufMatmul(type, batch, 256, 47, true);
+            // Cover every separately compiled MMQ family, including the IQ1
+            // device table that must be initialized beside its consuming kernels.
+            for (auto type : {GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
+                              GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0,
+                              GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K,
+                              GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ1_S,
+                              GGML_TYPE_IQ1_M, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
+                              GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
+                              GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
+                RunFloatGgufMatmul(type, 9, 256, 47, true);
+                RunFloatGgufMatmul(type, 33, 256, 129, true);
+            }
             for (auto type : {GGML_TYPE_Q2_0, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
                               GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
-                RunFloatMmq(type, 9, 256, 47);
-                RunFloatMmq(type, 33, 256, 129);
+                RunFloatGgufMatmul(type, 9, 256, 47);
+                RunFloatGgufMatmul(type, 33, 256, 129);
             }
-            RunFloatMmq(GGML_TYPE_IQ3_XXS, 65, 2560, 65);
-            RunFloatMmq(GGML_TYPE_IQ4_NL, 129, 320, 47);
-            RunFloatMmq(GGML_TYPE_Q2_0, 129, 320, 47);
+            RunFloatGgufMatmul(GGML_TYPE_IQ3_XXS, 65, 2560, 65);
+            RunFloatGgufMatmul(GGML_TYPE_IQ4_NL, 129, 320, 47);
+            RunFloatGgufMatmul(GGML_TYPE_Q2_0, 129, 320, 47);
             std::puts("PASS: FP32 GGUF MMQ and Linear dispatch"); return 0;
         }
         if (argc > 1 && std::strcmp(argv[1], "--grouped") == 0) {

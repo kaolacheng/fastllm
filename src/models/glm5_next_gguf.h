@@ -12,10 +12,21 @@ namespace glm5_next_detail {
 // tensors with K transposed per head. Consume the source names so restoration
 // is idempotent and ordinary HF checkpoints never enter these conversions.
 inline void RestoreGgufWeights(WeightMap &weights, int layers, int heads,
-                              int keyDim, int valueDim, int latentDim) {
-    for (int layer = 0; layer < layers; ++layer) {
+                              int keyDim, int valueDim, int latentDim, int firstLayer = 0) {
+    for (int layer = firstLayer; layer < layers; ++layer) {
         const std::string prefix = "model.language_model.layers." + std::to_string(layer) + ".";
         const std::string attn = prefix + "self_attn.";
+        // Some GGUF exporters retain a leading singleton dimension on the
+        // depthwise convolution weights. Their channel/kernel layout is unchanged.
+        for (const char *name : {"q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight"}) {
+            auto conv = weights.weight.find(attn + name);
+            if (conv != weights.weight.end()) {
+                Data &weight = conv->second;
+                if (weight.dims.size() == 4 && weight.dims[0] == 1) {
+                    weight.Reshape({weight.dims[1], weight.dims[2], weight.dims[3]});
+                }
+            }
+        }
         auto decay = weights.weight.find(attn + "gguf_decay");
         if (decay != weights.weight.end()) {
             const Data &source = decay->second;

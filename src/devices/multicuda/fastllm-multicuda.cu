@@ -1325,6 +1325,7 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     curLen += copyLen;
                 }
             } else if (weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 ||
+                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
                        weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E8M0 ||
                        weight.dataType == fastllm::DataType::NVFP4_BLOCK_32_E8M0 ||
                        weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
@@ -1518,6 +1519,7 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     curLen += copyLen;
                 }
             } else if (weight.dataType == fastllm::DataType::NVFP4_BLOCK_16 ||
+                       weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED ||
                        weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E8M0 ||
                        weight.dataType == fastllm::DataType::NVFP4_BLOCK_32_E8M0 ||
                        weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
@@ -1530,10 +1532,17 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     8 + sizeof(float) : packedE4M3 ? 9 : packedBlock / 2 + sizeof(uint8_t);
                 // The packed E4M3 rows keep a four-byte row-global multiplier
                 // before the nine-byte blocks, so every slice starts past it.
-                const size_t rowPayload = packedE4M3 ? sizeof(float) : 0;
                 size_t srcRowBytes = fastllm::GetDataBytes(weight.dataType, 1, m);
                 size_t dstRowBytes = fastllm::GetDataBytes(weight.dataType, 1, len);
+                const size_t header = weight.dataType ==
+                    fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED ? sizeof(float) : 0;
+                if (header) {
+                    state = FastllmCudaMemcpy2D(deviceWeightData, dstRowBytes,
+                        sourceWeightData, srcRowBytes, header, kSize,
+                        GetCudaMemcpyType(mallocType, sourceWeightType), deviceId, rootDevice);
+                }
                 for (auto &it : div) {
+                    if (state != cudaSuccess) break;
                     int copyLen = it.second - it.first;
                     fastllm::AssertInFastLLM(
                         it.first % packedBlock == 0 &&
@@ -1543,10 +1552,10 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     if (mallocType == 0) {
                         cudaSetDevice(rootDevice);
                     }
-                    size_t dstOffsetBytes = rowPayload +
-                        static_cast<size_t>(curLen / packedBlock) * blockBytes;
-                    size_t srcOffsetBytes = rowPayload +
-                        static_cast<size_t>(it.first / packedBlock) * blockBytes;
+                    size_t dstOffsetBytes =
+                        header + static_cast<size_t>(curLen / packedBlock) * blockBytes;
+                    size_t srcOffsetBytes =
+                        header + static_cast<size_t>(it.first / packedBlock) * blockBytes;
                     size_t copyBytes =
                         static_cast<size_t>(copyLen / packedBlock) * blockBytes;
                     state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + dstOffsetBytes,
@@ -3441,7 +3450,7 @@ void FastllmNcclBroadcast(void* data, int count, int dataType, int root, int dev
 // 功能：将所有卡上的 data 数据进行 Sum 求和，结果保存在 dest 中 (支持 in-place，即 data == dest)
 static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
                                     int dataType, int deviceId,
-                                    bool allowCustomAllReduce) {
+                                    bool allowCustomAllReduce, int hostSpinMicroseconds = 0) {
     if (data == nullptr || dest == nullptr || count <= 0) {
         return;
     }
@@ -3518,7 +3527,8 @@ static void FastllmNcclAllReduceImpl(void* data, void* dest, int count,
         }
     }
     auto waitForRanks = [&](fastllm::NcclSubmitRendezvous::Phase phase) {
-        if (rendezvous == nullptr || rendezvous->Wait(rank, phase, count, dataType)) {
+        if (rendezvous == nullptr || rendezvous->Wait(rank, phase, count, dataType,
+                std::chrono::microseconds(hostSpinMicroseconds))) {
             return true;
         }
         printf("Error: AllReduce submission on device %d: %s\n",
@@ -3563,6 +3573,11 @@ void FastllmNcclAllReduce(void* data, void* dest, int count, int dataType, int d
 void FastllmNcclAllReduceNoCustom(void* data, void* dest, int count,
                                   int dataType, int deviceId) {
     FastllmNcclAllReduceImpl(data, dest, count, dataType, deviceId, false);
+}
+
+void FastllmNcclAllReduceNoCustomWithSpin(void* data, void* dest, int count,
+                                       int dataType, int deviceId, int hostSpinMicroseconds) {
+    FastllmNcclAllReduceImpl(data, dest, count, dataType, deviceId, false, hostSpinMicroseconds);
 }
 
 bool FastllmNcclAllGather(const void* data, void* dest, int count,

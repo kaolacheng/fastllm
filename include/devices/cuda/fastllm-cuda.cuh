@@ -285,6 +285,8 @@ bool FastllmCudaGetNcclForceSync();
 void FastllmCudaSetWeightSlabBytes(size_t bytes);
 size_t FastllmCudaGetWeightSlabBytes();
 void *FastllmCudaMallocModelWeight(size_t size, const std::string &name);
+void *FastllmCudaMallocModelWeightGrouped(size_t size, const std::string &name, bool transientExpert);
+bool FastllmCudaIsWeightSlabPointer(const void *pointer);
 void FastllmCudaMemPoolStats();
 void * FastllmCudaDirectMalloc(size_t size);
 void FastllmCudaDirectFree(void *ret);
@@ -771,6 +773,13 @@ bool FastllmCudaQwen4GatherKV(const fastllm::Data &key,
                              const fastllm::Data &indices,
                              fastllm::Data &compactKey,
                              fastllm::Data &compactValue);
+// Indexed FP16 prefill without expanded KV tensors. Returns false for
+// unsupported layouts, devices, or graph capture so the caller can fall back.
+bool FastllmCudaQwen4SparsePrefill(
+    const fastllm::Data &query, const fastllm::Data &key,
+    const fastllm::Data &value, const fastllm::Data &indices,
+    fastllm::Data &output, int groups, float scale);
+
 bool FastllmCudaQwen4PrepareSparseBatch(
         const fastllm::Data &query, const fastllm::Data &key,
         const fastllm::Data &value, const fastllm::Data &indices,
@@ -1241,8 +1250,10 @@ extern "C" bool FastllmCudaDeepSeekV4WoADeepGemmSm120(
                               fastllm::Data &output);
 #endif
 namespace fastllm {
-// Verifier batches below this thread-local threshold must use a native linear
-// path whose arithmetic is equivalent to independent single-token decoding.
+// Request the single-row reduction order below this thread-local threshold
+// for paths that support it (notably the FP32 expert router). BF16-to-BF16
+// batches of eight or more rows may use FP32-accumulating cuBLAS and must be
+// compared with a numerical tolerance, not bitwise equality.
 int FastllmCudaGetLinearExactBatchThreshold();
 void FastllmCudaSetLinearExactBatchThreshold(int threshold);
 bool FastllmCudaTryTritonDeepSeekV4WoA(const Data &o, Data &woA,
@@ -1386,6 +1397,9 @@ bool FastllmCudaQuantizeLinearWeightNVFP4Block16Rows(
 
 bool FastllmCudaQuantizeLinearWeightNVFP4Block16(
     const fastllm::Data &input, fastllm::Data &output);
+// Check the concrete GGUF layout before NUMA prefill streams it to CUDA.
+bool FastllmCudaGGUFPrefillSupported(fastllm::DataType inputType, int weightType);
+
 bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 bool FastllmCudaFloatMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data &w1, fastllm::Data &output,
                                         fastllm::Data **gateups, fastllm::Data **downs, const float *scores,
@@ -1448,6 +1462,10 @@ bool FastllmCudaBatchMatMul(const fastllm::Data &input0, const fastllm::Data &in
                                   int input0Spatial, int input1Spatial, int outputSpatial,
                                   int input0Stride, int input1Stride,
                                   int batch, int n, int m, int k, float alpha);
+// Dense [batch, rows, channels] projections with the same one-row cuBLAS
+// calls as decode. Read/write strided rows directly, without Split/Cat copies.
+bool FastllmCudaBatchMatMulSingleRows(const fastllm::Data &input,
+    const fastllm::Data &weight, fastllm::Data &output, bool transposeWeight, float alpha = 1.0f);
 bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Data &input1, fastllm::Data &output,
                               int input0Spatial, int input1Spatial, int outputSpatial,
                               int input0Stride, int input1Stride,
@@ -1748,6 +1766,14 @@ bool FastllmCudaMergeMOENVFP4E4M3MarlinIndexedClamped(
         fastllm::Data **weights, int weightsBatch,
         const int32_t *indices, const float *scores,
         int batch, int topk, float swigluLimit);
+// Independent BF16 rows preserve the batch-1 Marlin reduction schedule.
+// Returns false before launching when the shape cannot share bounded scratch.
+bool FastllmCudaMergeMOENVFP4E4M3MarlinRows(
+        const fastllm::Data &input, fastllm::Data &gateOutput,
+        fastllm::Data &activation, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch,
+        const int32_t *indices, const float *scores,
+        int batch, int topk);
 bool FastllmCudaSwigluClamped(
         const fastllm::Data &input, float limit, fastllm::Data &output);
 #ifndef USE_ROCM
@@ -1775,34 +1801,46 @@ bool FastllmCudaMoeCacheRequested();
 // leave no published cache; the configured MoE backend remains usable.
 // Borrowed shards must remain alive and unchanged until cache release.
 // Without a callback, snapshot the host weights for the ordinary CUDA cache.
+// allowStreaming permits a zero resident-cache budget when a registered NUMA
+// backend can execute misses with temporary GPU uploads. It requires a callback.
 bool FastllmCudaPrepareMoeCache(
         const FastllmCudaMoeCacheLayer *layers, int layerCount,
-        const std::function<void()> &registerNumaWeights = {});
+        const std::function<void()> &registerNumaWeights = {}, bool allowStreaming = false);
 bool FastllmCudaCanRunMoeCache(
         fastllm::Data **weights, int weightsBatch);
 
-// Read-only snapshot of existing canonical GGUF cache records on this GPU.
-// No admission/eviction or allocation is performed. The caller must finish
+// Snapshot of canonical GGUF or native compact GLM records on this GPU.
+// create permits lazy allocation of a prepared cache; no admission/eviction
+// is performed. The caller must finish
 // using these pointers before the next decode/cache mutation or cache release.
-struct FastllmCudaMoeGGUFResidents {
+struct FastllmCudaMoePrefillResidents {
     std::vector<const void *> weights; // gate/down pairs, zero-based expert IDs
+    int weightType = -1;
     int gateType = -1, downType = -1, hidden = 0, inter = 0;
+    int ownerRank = 0, ownerCount = 1;
+    bool nativeGlm = false;
 };
-bool FastllmCudaGetMoeGGUFResidents(fastllm::Data **weights, int experts,
-                                  FastllmCudaMoeGGUFResidents &view);
+bool FastllmCudaGetMoePrefillResidents(fastllm::Data **weights, int experts,
+                                  FastllmCudaMoePrefillResidents &view, bool create = false);
 
-// Reservations exclude all currently active resident experts. Upload directly
-// into these canonical gate/down destinations, then publish on the same stream
-// after both projections are ready. The model serializes calls on each device.
-struct FastllmCudaMoeGGUFPrefillPlan {
+// Reservations exclude all currently active resident experts. Compatible layouts
+// upload directly into these gate/down destinations; other native NUMA uploads
+// use StoreMoePrefillExpert. Publish after both projections are ready on the same
+// stream. The model serializes calls on each device.
+struct FastllmCudaMoePrefillPlan {
     std::vector<void *> weights;
     std::vector<int> keys, slots;
     void *cache = nullptr;
+    int table = -1;
 };
-void FastllmCudaPlanMoeGGUFPrefill(fastllm::Data **weights, int experts,
+void FastllmCudaPlanMoePrefill(fastllm::Data **weights, int experts,
     const int32_t *indices, const float *scores, int rows, int topk,
-    const std::unordered_set<int> &selected, FastllmCudaMoeGGUFPrefillPlan &plan);
-void FastllmCudaPublishMoeGGUFPrefill(const FastllmCudaMoeGGUFPrefillPlan &plan);
+    const std::unordered_set<int> &selected, FastllmCudaMoePrefillPlan &plan);
+void FastllmCudaPublishMoePrefill(const FastllmCudaMoePrefillPlan &plan);
+// Retain an already-uploaded NUMA expert without uploading its weights again.
+// The source tensors remain valid until the current compute stream completes.
+void FastllmCudaStoreMoePrefillExpert(const FastllmCudaMoePrefillPlan &plan,
+    int expert, const fastllm::Data &gate, const fastllm::Data &down);
 
 struct FastllmCudaMoeGGUFCacheView {
     const uint8_t *records;
@@ -1821,20 +1859,31 @@ struct FastllmCudaMoeGGUFCacheView {
     // and activation scratch use compact order. Entries must be distinct.
     const int32_t *routeMap = nullptr;
     int routeCount = 0;
-    // Temporary DMA records can retain NUMA's cross-interleaved gate/up and
-    // R4 packing. -1 means canonical GGUF; cache admission stays canonical.
+    // Temporary DMA and whole-expert GLM cache records can retain NUMA's
+    // cross-interleaved gate/up and R4 packing. -1 means canonical GGUF.
     int numaGateType = -1, numaDownType = -1;
+    // Optional device table of separately allocated canonical records. Disk
+    // caches can batch resident experts without copying them into one arena.
+    const uint8_t *const *recordPointers = nullptr;
 };
 bool FastllmCudaMoeGGUFCacheSupported(int type, int columns);
 bool FastllmCudaMoeGGUFCacheNumaSupported(int gateType, int downType,
     int hidden, int inter, int rows);
 bool FastllmCudaMoeGlm5GGUFCacheSupported(int gateType, int downType, int hidden, int inter);
-// Ordinary IQ2 gate/up + IQ3/IQ4 down records. Match GLM GGUF's Q8_K
+bool FastllmCudaMoeGlm5GGUFCacheNumaSupported(int gateType, int downType, int hidden, int inter);
+// Canonical or supported NUMA IQ/K-quant records. Match GLM GGUF's Q8_K
 // activations, asymmetric clamp, score placement and BF16 boundaries.
 bool FastllmCudaMoeGlm5GGUFCacheCompute(
         const fastllm::Data &input, fastllm::Data &activation,
         const FastllmCudaMoeGGUFCacheView &view,
         const float *scores, int topk, float swigluLimit, float *perExpert);
+// GPU-only GLM GGUF experts; shares the scored cache arithmetic and keeps
+// routing on CUDA. Long prefills are tiled with bounded scratch storage.
+bool FastllmCudaMergeMOEGlm5GGUFResident(
+        const fastllm::Data &input, fastllm::Data &activation,
+        fastllm::Data &workspace, fastllm::Data &output,
+        fastllm::Data **weights, int weightsBatch,
+        const int32_t *indices, const float *scores, int topk, float swigluLimit);
 // V4.1 cache records borrow NUMA's cross-interleaved Q2_K/Q4_K R4 blocks.
 // Input already has the model's block-32 FP8 boundary. Scores precede
 // down-input quantization, and per-expert outputs are rounded to BF16.
@@ -1853,6 +1902,22 @@ bool FastllmCudaMoeGGUFCacheCompute(
         const fastllm::Data &input, fastllm::Data &gateOutput,
         fastllm::Data &output, const FastllmCudaMoeGGUFCacheView &view,
         const float *scores, int topk, float *perExpert = nullptr);
+// Gate weights are already ready on the calling stream. Down weights may
+// still be uploading; optional timing events exclude that wait from compute.
+struct FastllmCudaMoeStageEvents {
+    // Keep this host-facing header independent of CUDA runtime types.
+    void *downReady = nullptr, *gateDone = nullptr, *downStart = nullptr;
+};
+bool FastllmCudaMoeGlm5GGUFCacheComputeStaged(
+        const fastllm::Data &input, fastllm::Data &activation,
+        const FastllmCudaMoeGGUFCacheView &view,
+        const float *scores, int topk, float swigluLimit, float *perExpert,
+        const FastllmCudaMoeStageEvents &events);
+bool FastllmCudaMoeGGUFCacheComputeStaged(
+        const fastllm::Data &input, fastllm::Data &gateOutput,
+        fastllm::Data &output, const FastllmCudaMoeGGUFCacheView &view,
+        const float *scores, int topk, float *perExpert,
+        const FastllmCudaMoeStageEvents &events);
 // perExpert, when provided, receives unweighted FP32 [rows, topk, hidden]
 // results; missing route slots write zero. The caller owns the final reduction.
 // Use the same fused kernels with immutable GPU weight pointers. Routing stays
@@ -1944,6 +2009,11 @@ bool FastllmCudaMoeFP8CacheCompute(
         fastllm::Data &output, const FastllmCudaMoeFP8CacheView &view,
         const int32_t *slots, const float *scores, int topk,
         float *perExpert = nullptr);
+bool FastllmCudaMoeFP8CacheComputeStaged(
+        const fastllm::Data &input, fastllm::Data &gateOutput,
+        fastllm::Data &output, const FastllmCudaMoeFP8CacheView &view,
+        const int32_t *slots, const float *scores, int topk, float *perExpert,
+        const FastllmCudaMoeStageEvents &events);
 #endif
 bool FastllmCudaNVFP4E4M3GroupedMoeSupported(int device);
 bool FastllmCudaHalfMatMulFloatInt4Group128(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
@@ -2472,5 +2542,11 @@ bool FastllmCudaQwen4SharedExpert(
 // Snapshot completed GPU cache counters. values: hits, misses, payload bytes,
 // slots, host records. Synchronizes the device; call outside timed inference.
 extern "C" bool fastllm_moe_cuda_cache_stats(int device, uint64_t *values, bool reset);
+
+// One compact expert, arbitrary routed rows; FP32 per-route output retains
+// GLM's BF16 boundaries and score placement. Enqueues on the calling stream.
+bool FastllmCudaGlm5DiskExpert(const fastllm::Data &input, const fastllm::Data &scores,
+    const fastllm::Data &gate, const fastllm::Data &down, fastllm::Data &activation,
+    fastllm::Data &output, float limit);
 
 #endif // FASTLLM_CUDA_CUH

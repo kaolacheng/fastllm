@@ -902,9 +902,9 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         dest = 'moe_cuda_cache', type = _memory_size_bytes,
                         default = 0,
                         help = '混合推理时用于缓存MoE专家的CUDA显存，如3g；0表示关闭')
-    cache_policy = parser.add_argument_group('GGUF单token混合decode缓存更新（加载模型前设置）')
+    cache_policy = parser.add_argument_group('GGUF/NVFP4/FP8混合decode缓存更新（加载模型前设置）')
     for name, kind, default, help_text in (
-        ('half_life', _moe_cache_float, 128., 'decode热度半衰期，单位token；0不衰减，默认128'),
+        ('half_life', _moe_cache_float, 128., 'decode热度半衰期，单位解码步（可验证多个推测token）；0不衰减，默认128'),
         ('update_interval', _moe_cache_interval, 1, '每多少个decode步更新一次，默认1'),
         ('max_replacements', _moe_cache_int, 96, '每次更新跨层换入专家数上限；0关闭decode换入，默认96'),
         ('max_bytes', _memory_size_bytes, 0, '每次更新换入字节上限，如30m；0不另设字节上限'),
@@ -958,7 +958,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "CUDA模型权重slab大小（MiB）；默认按模型选择，0表示关闭")
     parser.add_argument("--mtp", type = int, default = 0, help = "支持MTP的模型每步生成的draft token数，0表示关闭（默认），当前最大8")
     parser.add_argument("--mtp_min_p", "--mtp-min-p", type = _probability, default = None,
-                        help = "Qwen4 贪心 MTP 草稿概率阈值；低于阈值时停止草稿链，0 关闭（默认），--mtp 指定最大草稿数")
+                        help = "Qwen4 / GLM-5.3 贪心 MTP 草稿概率阈值；低于阈值时停止草稿链，0 关闭（默认），--mtp 指定最大草稿数")
     parser.add_argument("--mtp_fp8_draft_head", "--mtp-fp8-draft-head",
                         type = int, choices = [0, 1], default = None,
                         help = "Qwen3.5 系列多卡 MTP 的 FP8 draft 输出头；1 开启，0 复用原输出头以节省显存；未指定时沿用 FASTLLM_MTP_FP8_DRAFT_HEAD（默认开启）")
@@ -1325,6 +1325,7 @@ def make_normal_llm_model(args, startup_progress = None):
     is_deepseek_v41_model = False
     is_laguna_hybrid_tp_model = False
     is_laguna_model = False
+    is_naive_n05_model = False
     is_qwen35_model = False
     is_qwen38_flash_next_model = False
     is_glm5_next_model = False
@@ -1340,6 +1341,9 @@ def make_normal_llm_model(args, startup_progress = None):
             architectures = config.get("architectures", [])
             architecture = architectures[0] if architectures else ""
             model_type = config.get("model_type", "")
+            is_naive_n05_model = model_type == "naive_n05_flash"
+            if is_naive_n05_model:
+                is_thread_tp_moe_model = True
             is_laguna_model = (architecture == 'LagunaForCausalLM' or
                                 model_type == 'laguna')
             is_dots3_note_model = (
@@ -1367,6 +1371,8 @@ def make_normal_llm_model(args, startup_progress = None):
                 model_type == "glm5_next" or
                 text_model_type == "glm5_next_text"
             )
+            if is_glm5_next_model:
+                is_thread_tp_moe_model = True
             is_deepseek_v4_model = (
                 architecture in ("DeepseekV4ForCausalLM",
                                  "DeepSeekV4ForCausalLM") or
@@ -1608,6 +1614,11 @@ def make_normal_llm_model(args, startup_progress = None):
                 args.device = (cuda_spec or tp_device) if is_qwen38_flash_next_model else tp_device
             if (not user_set_moe_device):
                 args.moe_device = (_thread_tp_cuda_device_spec(args.tp) or args.device) if is_thread_tp_moe_model else args.device
+    if (is_naive_n05_model and _uses_thread_tp(getattr(args, "tp", "")) and
+            _thread_tp_cuda_device_count(args.tp) > 1 and cuda_slab_auto):
+        # TP produces thousands of small expert shards per GPU. Keep compact
+        # NVFP4 sources in slabs that Marlin can release one layer at a time.
+        args.cuda_slab = 16
     if ((is_multicuda_tp_model or is_laguna_hybrid_tp_model) and
             _uses_multicuda_device(args.moe_device)):
         # Large MoE checkpoints have tens of thousands of routed-expert tensors.
@@ -1640,6 +1651,13 @@ def make_normal_llm_model(args, startup_progress = None):
         # dense GPU weights instead: their many 6.25 MiB and smaller allocations
         # otherwise waste hundreds of MiB at the CUDA allocation granularity.
         # A 64 MiB slab retains 256-byte alignment and the existing compute paths.
+        args.cuda_slab = 64
+    if (is_glm5_next_model and gguf_config is not None and cuda_slab_auto and
+            _uses_thread_tp(getattr(args, "tp", "")) and
+            (args.moe_device_layers >= 0 or _uses_cuda_device(args.moe_device))):
+        # Resident expert TP doubles the number of small packed allocations.
+        # Pack them into the existing weight slabs instead of paying CUDA's
+        # allocation granularity for each shard. Explicit --cuda_slab wins.
         args.cuda_slab = 64
     if ((args.device and args.device.find("numa") != -1) or args.moe_device.find("numa") != -1 or
         (args.device and args.device.find("tfacc") != -1) or args.moe_device.find("tfacc") != -1):
@@ -1712,7 +1730,7 @@ def make_normal_llm_model(args, startup_progress = None):
             if (atype_was_auto and not is_deepseek_v41_model):
                 # DeepSeek-V4.1 的 SetDataType 只接受 float32（推理精度由模型内部
                 # 自己按 BF16 走），--tp 不能像其它模型那样把 atype 改成 float16。
-                args.atype = "bfloat16" if is_laguna_model else "float16"
+                args.atype = "bfloat16" if (is_laguna_model or is_naive_n05_model) else "float16"
             if (not(args.device and args.device != "")):
                 args.device = _first_thread_tp_cuda_device(tp_arg)
     if (args.moe_atype == "" and is_moe_model and args.dtype == "fp8_e4m3"):
@@ -1825,9 +1843,10 @@ def make_normal_llm_model(args, startup_progress = None):
     mtp_min_p = getattr(args, "mtp_min_p", None)
     if mtp_min_p is not None:
         mtp_min_p = _probability(mtp_min_p)
-        if mtp_min_p > 0 and (not is_qwen38_flash_next_model or mtp <= 0):
-            raise ValueError("--mtp_min_p requires Qwen4 with --mtp enabled")
-        os.environ["FASTLLM_QWEN4_MTP_MIN_P"] = str(mtp_min_p)
+        if mtp_min_p > 0 and (not (is_qwen38_flash_next_model or is_glm5_next_model) or mtp <= 0):
+            raise ValueError("--mtp_min_p requires Qwen4 or GLM-5.3 with --mtp enabled")
+        name = "FASTLLM_GLM5_NEXT_MTP_MIN_P" if is_glm5_next_model else "FASTLLM_QWEN4_MTP_MIN_P"
+        os.environ[name] = str(mtp_min_p)
     os.environ["FASTLLM_GLM5_NEXT_ENABLE_MTP"] = str(mtp)
     graph = None
     if (args.custom != ""):

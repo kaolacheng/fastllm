@@ -474,6 +474,9 @@ if hasattr(fastllm_lib, "fastllm_moe_cuda_cache_stats"):
     fastllm_lib.fastllm_moe_cuda_cache_stats.restype = ctypes.c_bool
 fastllm_lib.set_moe_cpu_cache.argtypes = [ctypes.c_uint64]
 fastllm_lib.get_disk_moe_cache_stats.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
+if hasattr(fastllm_lib, "get_disk_moe_cache_stats_v2"):
+    fastllm_lib.get_disk_moe_cache_stats_v2.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_int]
+    fastllm_lib.get_disk_moe_cache_stats_v2.restype = ctypes.c_int
 
 fastllm_lib.apply_chat_template.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
 fastllm_lib.apply_chat_template.restype = ctypes.c_char_p
@@ -647,11 +650,12 @@ def set_moe_cuda_cache(bytes_: int):
 def set_moe_cache_policy(*, half_life=128., update_interval=1, max_replacements=96,
                          max_bytes=0, min_heat=1., margin=1., factor=1.,
                          min_residence=0, prefill_prior=0., rank_by_bytes=False):
-    """Configure GGUF single-token hybrid decode admission before model loading.
+    """Configure GGUF/NVFP4/FP8 hybrid decode admission before model loading.
 
-    Counts and byte limits apply per update, across all layers. max_bytes=0
+    Counts and byte limits apply per device/update, across all layers. max_bytes=0
     imposes no byte cap; max_replacements=0 disables decode admission.
-    half_life=0 disables decay. prefill_prior weights rescaled prompt heat and
+    One decode step may verify several speculative tokens. half_life=0 disables
+    decay. prefill_prior weights rescaled prompt heat and
     does not discard resident payloads. Existing cache policies keep their config.
     """
     for name, value, minimum in (("update_interval", update_interval, 1),
@@ -725,10 +729,16 @@ def set_moe_cpu_cache(bytes_: int):
 
 def get_disk_moe_cache_stats():
     """Process-wide cumulative route counts and resident expert payload bytes."""
+    names = ("cpu_bytes", "cuda_bytes", "cpu_hits", "cuda_hits", "misses",
+             "disk_bytes", "uploads", "cpu_evictions", "cuda_evictions",
+             "cpu_cuda_overlap_bytes", "cuda_demotions", "cuda_demotion_bytes")
+    if hasattr(fastllm_lib, "get_disk_moe_cache_stats_v2"):
+        values = (ctypes.c_uint64 * len(names))()
+        count = fastllm_lib.get_disk_moe_cache_stats_v2(values, len(names))
+        return dict(zip(names[:count], values))
     values = (ctypes.c_uint64 * 9)()
     fastllm_lib.get_disk_moe_cache_stats(values)
-    return dict(zip(("cpu_bytes", "cuda_bytes", "cpu_hits", "cuda_hits", "misses",
-                     "disk_bytes", "uploads", "cpu_evictions", "cuda_evictions"), values))
+    return dict(zip(names[:9], values))
 
 def disable_cuda_malloc():
     fastllm_lib.disable_cuda_malloc();

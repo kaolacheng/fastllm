@@ -4552,7 +4552,7 @@ static size_t FastllmCudaAlignBytes(size_t size, size_t align) {
     return ((size + align - 1) / align) * align;
 }
 
-static std::string FastllmCudaWeightSlabGroup(const std::string &name) {
+static std::string FastllmCudaWeightSlabGroup(const std::string &name, bool transientExpert) {
     // Expert-parallel source tensors are consolidated and released one layer
     // at a time during the first ForwardGPU call.  Do not mix different layers
     // in the same slab, otherwise one live tensor from a later layer pins all
@@ -4564,10 +4564,18 @@ static std::string FastllmCudaWeightSlabGroup(const std::string &name) {
             return name.substr(0, pos + std::strlen(marker));
         }
     }
+    if (transientExpert) {
+        size_t pos = name.find(".mlp.experts.");
+        if (pos != std::string::npos) return name.substr(0, pos + std::strlen(".mlp.experts."));
+    }
     return "";
 }
 
 void *FastllmCudaMallocModelWeight(size_t size, const std::string &name) {
+    return FastllmCudaMallocModelWeightGrouped(size, name, false);
+}
+
+void *FastllmCudaMallocModelWeightGrouped(size_t size, const std::string &name, bool transientExpert) {
     size_t slabBytes = FastllmCudaGetWeightSlabBytes();
     if (slabBytes == 0 || size == 0 || size > slabBytes / 2) {
         return FastllmCudaMalloc(size);
@@ -4579,7 +4587,7 @@ void *FastllmCudaMallocModelWeight(size_t size, const std::string &name) {
 
     const size_t align = 256;
     size_t aligned = FastllmCudaAlignBytes(size, align);
-    std::string group = FastllmCudaWeightSlabGroup(name);
+    std::string group = FastllmCudaWeightSlabGroup(name, transientExpert);
     std::lock_guard<std::mutex> lock(fastllmCudaWeightSlabMutex);
 
     auto &slabs = fastllmCudaWeightSlabs[id];
@@ -4629,6 +4637,12 @@ void *FastllmCudaMallocModelWeight(size_t size, const std::string &name) {
     fastllmCudaWeightSlabPtrs[ret] = {id, slab.base};
     fastllmCudaWeightSlabPtrCount.fetch_add(1, std::memory_order_relaxed);
     return ret;
+}
+
+bool FastllmCudaIsWeightSlabPointer(const void *pointer) {
+    if (!pointer || fastllmCudaWeightSlabPtrCount.load(std::memory_order_relaxed) == 0) return false;
+    std::lock_guard<std::mutex> lock(fastllmCudaWeightSlabMutex);
+    return fastllmCudaWeightSlabPtrs.count(const_cast<void *>(pointer)) != 0;
 }
 
 static bool FastllmCudaTryFreeWeightSlabPtr(void *ret) {
@@ -9275,10 +9289,10 @@ bool FastllmCudaKimiK3RecurrentKDA(
         FastllmCudaMemset0(state.cudaData, state.GetBytes());
     }
 #ifndef USE_ROCM
-    // Ordinary decode and prefill reuse register scan with shared CUDA scratch.
+    // Decode, multi-row verification and prefill share the exact register scan.
     // Auxiliary/state replay and graph capture keep the allocation-free path.
     if (dimension == KIMI_K3_KDA_DIMENSION && batch > 0 && heads > 0 &&
-        (sequence == 1 || sequence >= 64) && !stateOnly && !outputAux &&
+        sequence > 0 && !stateOnly && !outputAux &&
         normalizeQKInFp32 && roundBetaToBfloat16 &&
         aLog.Count(0) == (uint64_t)heads && !FastllmCudaGraphIsCapturing()) {
         size_t rows = (size_t)batch * sequence * heads;
@@ -11078,7 +11092,7 @@ __global__ void FastllmFusedSigmoidSelectExpert256Top10Kernel(
 // selection while reproducing its max/sum/division order exactly. One warp
 // then performs TopK; exact ties rebuild the original 64-thread lists and
 // merge tree so both instantiations remain compatible with the legacy path.
-template <bool APPLY_SOFTMAX, int EXPERTS, int TOPK>
+template <bool APPLY_SOFTMAX, int EXPERTS, int TOPK, bool APPLY_SIGMOID = false>
 __global__ void FastllmSelectExpertFixedTopKKernel(
         const float *logits, const float *bias, int32_t *index, float *score,
         int hasBias, int needNorm, float routeScale) {
@@ -11125,6 +11139,15 @@ __global__ void FastllmSelectExpertFixedTopKKernel(
             softmaxProbabilities[expert] /= denominator;
         }
         __syncthreads();
+        probabilityLogits = softmaxProbabilities;
+    }
+    if constexpr (APPLY_SIGMOID) {
+        // Match the standalone FP32 sigmoid, including its double division.
+        for (int expert = tid; expert < EXPERTS; expert += 32) {
+            float x = tokenLogits[expert];
+            softmaxProbabilities[expert] = 1.0 / (1.0 + expf(-x));
+        }
+        __syncwarp();
         probabilityLogits = softmaxProbabilities;
     }
     if (tid >= 32) {
@@ -12178,7 +12201,11 @@ static bool FastllmCudaFusedSelectExpert256(
     int biasType = !hasBias || gateBias->dataType == fastllm::DataType::FLOAT32 ? 0 :
                    (gateBias->dataType == fastllm::DataType::FLOAT16 ? 1 : 2);
 #ifndef USE_ROCM
-    if constexpr (ROUTER_SIGMOID) {
+    if constexpr (ROUTER_SIGMOID && ROUTER_TOPK == 8) {
+        FastllmSelectExpertFixedTopKKernel<false, 256, 8, true><<<tokens, 32>>>(
+            (const float *)cudaLogits, (const float *)cudaBias, cudaIndex, cudaScore,
+            hasBias ? 1 : 0, needNorm ? 1 : 0, routeScale);
+    } else if constexpr (ROUTER_SIGMOID) {
         if (logits.dataType == fastllm::DataType::FLOAT16) {
             FastllmFusedSigmoidSelectExpert256Top10Kernel<half><<<tokens, 32>>>(
                 (const half*)cudaLogits, cudaBias, cudaIndex, cudaScore,
@@ -12332,6 +12359,16 @@ bool FastllmCudaFusedSigmoidSelectExpert(
         const fastllm::Data &logits, const fastllm::Data *gateBias,
         fastllm::Data &index, fastllm::Data &score,
         int topk, bool needNorm, float routeScale) {
+#ifndef USE_ROCM
+    if (topk == 8 && !logits.dims.empty() && logits.dims.back() == 256 &&
+        logits.Count(0) > 0 && logits.dataType == fastllm::DataType::FLOAT32) {
+        if (gateBias && !gateBias->dims.empty() &&
+            (gateBias->Count(0) != 256 || gateBias->dataType != fastllm::DataType::FLOAT32))
+            return false;
+        return FastllmCudaFusedSelectExpert256<8, true>(
+            logits, gateBias, index, score, needNorm, routeScale);
+    }
+#endif
     if (topk != 10 || logits.dims.empty() || logits.dims.back() != 256 || logits.Count(0) == 0 ||
         (logits.dataType != fastllm::DataType::FLOAT16 &&
          logits.dataType != fastllm::DataType::BFLOAT16 &&
@@ -12848,6 +12885,62 @@ bool FastllmCudaEmbeddingDirect(const fastllm::Data &input, const fastllm::Data 
     }
 
     DeviceSync();
+    return true;
+}
+
+bool FastllmCudaBatchMatMulSingleRows(const fastllm::Data &input,
+        const fastllm::Data &weight, fastllm::Data &output, bool transposeWeight, float alpha) {
+    auto denseCuda = [](const fastllm::Data &data) {
+        return data.dataDevice == fastllm::DataDevice::CUDA && data.cudaData &&
+            !data.multiDeviceData && data.dims.size() == 3 && data.strides.size() == 3 &&
+            data.dims[0] > 0 && data.dims[1] > 0 && data.dims[2] > 0 &&
+            data.strides[2] == 1 && data.strides[1] == data.dims[2] &&
+            data.strides[0] == (uint64_t)data.dims[1] * data.dims[2];
+    };
+    if (!denseCuda(input) || !denseCuda(weight) || &output == &input || &output == &weight ||
+        input.dataDeviceIds != weight.dataDeviceIds || input.dataType != weight.dataType ||
+        input.dims[0] != weight.dims[0] ||
+        input.dims[2] != weight.dims[transposeWeight ? 2 : 1] ||
+        (input.dataType != fastllm::DataType::FLOAT32 &&
+         input.dataType != fastllm::DataType::FLOAT16 &&
+         input.dataType != fastllm::DataType::BFLOAT16)) return false;
+
+    const int batch = input.dims[0], rows = input.dims[1], m = input.dims[2];
+    const int k = weight.dims[transposeWeight ? 1 : 2];
+    if (!input.dataDeviceIds.empty()) FastllmCudaSetDevice(input.dataDeviceIds[0]);
+    output.dataType = input.dataType;
+    output.ToDevice(fastllm::DataDevice::CUDA, input.dataDeviceIds, false);
+    output.Resize({batch, rows, k});
+    output.Allocate();
+    auto handle = getFastllmCublasHandle();
+    const auto operation = transposeWeight ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const int weightStride = transposeWeight ? m : k;
+    const long long inputSpatial = (long long)rows * m;
+    const long long weightSpatial = (long long)m * k;
+    const long long outputSpatial = (long long)rows * k;
+    const float beta = 0;
+    for (int row = 0; row < rows; ++row) {
+        const void *x = (const char *)input.cudaData + (size_t)row * m * input.unitSize;
+        void *y = (char *)output.cudaData + (size_t)row * k * output.unitSize;
+        cublasStatus_t status;
+        if (input.dataType == fastllm::DataType::BFLOAT16) {
+            status = cublasGemmStridedBatchedEx(handle, operation, CUBLAS_OP_N,
+                k, 1, m, &alpha, weight.cudaData, CUDA_R_16BF, weightStride, weightSpatial,
+                x, CUDA_R_16BF, m, inputSpatial, &beta, y, CUDA_R_16BF, k, outputSpatial,
+                batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        } else if (input.dataType == fastllm::DataType::FLOAT16) {
+            const half halfAlpha = __float2half(alpha), halfBeta = __float2half(beta);
+            status = cublasHgemmStridedBatched(handle, operation, CUBLAS_OP_N,
+                k, 1, m, &halfAlpha, (const half *)weight.cudaData, weightStride, weightSpatial,
+                (const half *)x, m, inputSpatial, &halfBeta, (half *)y, k, outputSpatial, batch);
+        } else {
+            status = cublasSgemmStridedBatched(handle, operation, CUBLAS_OP_N,
+                k, 1, m, &alpha, (const float *)weight.cudaData, weightStride, weightSpatial,
+                (const float *)x, m, inputSpatial, &beta, (float *)y, k, outputSpatial, batch);
+        }
+        fastllm::AssertInFastLLM(status == CUBLAS_STATUS_SUCCESS,
+            "CUDA single-row batched MatMul failed.");
+    }
     return true;
 }
 
@@ -15057,7 +15150,7 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
     uint64_t seed = rng();
 
     cudaError_t samplingState =
-        flashinfer::sampling::TopKTopPSamplingFromProb<float, int>(
+        flashinfer::sampling::TopKTopPSamplingFromProb<float, int, 0>(
         cudaProbs, cudaTopKArr, cudaTopPArr, cudaOutput,
         cudaSamplingValid,
         (int *)nullptr,
@@ -15943,7 +16036,8 @@ bool FastllmCudaDFlashTopK(
     cudaError_t state = cudaMemsetAsync(
         scratch.cudaData, 0, scratchBytes, cudaStreamPerThread);
     if (state == cudaSuccess) {
-        state = flashinfer::sampling::TopKDispatch<float, int>(
+        // This entry accepts topk <= 50, deterministic results, and no tie-break mode.
+        state = flashinfer::sampling::TopKDispatch<float, int, 1, true, 128>(
             (float*)logits.cudaData, candidateIds, candidateScores,
             (uint32_t)rows, (uint32_t)topk, (uint32_t)channels,
             rowStates, true, true,
@@ -16224,7 +16318,7 @@ bool FastllmCudaDFlashRejectionSampling(
     if (state == cudaSuccess) {
         static thread_local std::mt19937 rng(std::random_device{}());
         uint64_t seed = ((uint64_t)rng() << 32) | rng();
-        state = flashinfer::sampling::ChainSpeculativeSampling<float, int>(
+        state = flashinfer::sampling::ChainSpeculativeSampling<float, int, 1>(
             draftProbs, cudaDraftTokens, targetProbs, cudaOutput,
             cudaAccepted, cudaEmitted, (uint32_t)batch,
             (uint32_t)draftTokens, (uint32_t)vocabSize,
@@ -16303,7 +16397,7 @@ bool FastllmCudaTopKTopPSamplingToDevice(
     static thread_local std::mt19937 rng(std::random_device{}());
     uint64_t seed = rng();
     cudaError_t samplingState =
-        flashinfer::sampling::TopKTopPSamplingFromProb<float, int>(
+        flashinfer::sampling::TopKTopPSamplingFromProb<float, int, 0>(
         probs, topKArr, topPArr, output,
         (bool *)floatOutput,
         (int *)nullptr,
@@ -16439,7 +16533,7 @@ bool FastllmCudaMtpSampleDraft(float *logits, float *proposalProbs,
     cudaError_t state = cudaMemcpyAsync(proposalProbs, ws.a,
         (size_t)batch * vocabSize * sizeof(float), cudaMemcpyDeviceToDevice, stream);
     if (state == cudaSuccess) {
-        state = flashinfer::sampling::SamplingFromProb<float, int>(
+        state = flashinfer::sampling::SamplingFromProb<float, int, 1>(
             proposalProbs, ws.output, ws.valid, nullptr, batch, vocabSize, true,
             nullptr, FastllmMtpSamplingSeed(), nullptr, 0, stream);
     }
@@ -16470,7 +16564,7 @@ bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
     if (state == cudaSuccess)
         state = cudaMemsetAsync(ws.emitted, 0, batch * sizeof(int), stream);
     if (state == cudaSuccess) {
-        state = flashinfer::sampling::ChainSpeculativeSampling<float, int>(
+        state = flashinfer::sampling::ChainSpeculativeSampling<float, int, 1>(
             proposalProbs, ws.draftIds, ws.a, ws.output, ws.accepted, ws.emitted,
             batch, draftTokens, vocabSize, true, nullptr, FastllmMtpSamplingSeed(),
             nullptr, 0, stream);

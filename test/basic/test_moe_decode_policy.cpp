@@ -211,6 +211,31 @@ static void TestFrequencyIndexUpdates() {
     Require(a.key == 7 && a.slot == 0, "residency refresh lost a former resident candidate");
 }
 
+static void TestFrequencyAvailability() {
+    fastllm::MoeCacheConfig config;
+    config.halfLife = 0; config.replacementMargin = 0;
+    fastllm::MoeFrequencyPolicy p({0,0,0}, {0}, 1, config);
+    int hot=0, warm=1;
+    p.SetCandidateEligible(hot, false);
+    p.BeginStep();
+    for (int i=0;i<8;++i) p.Observe(0,&hot,1);
+    p.Observe(0,&warm,1);
+    auto plan=p.EndStep();
+    Require(plan.size()==1 && plan[0].key==warm,"unavailable hot expert blocked available admission");
+    Require(p.Score(hot)==8,"unavailable expert lost heat");
+    p.SetCandidateEligible(hot,true);p.BeginStep();plan=p.EndStep();
+    Require(plan.size()==1 && plan[0].key==hot,"returning payload did not recover its heat");
+    p.SetCandidateEligible(hot,false);
+    Require(p.Slot(hot)==0,"candidate availability evicted a live resident");
+    Require(p.Evict(hot)==0 && p.Evict(hot)==-1 && p.Score(hot)==8,"migration lost heat or evicted twice");
+    p.BeginStep();plan=p.EndStep();
+    Require(plan.size()==1 && plan[0].key==warm,"excluded former resident reentered the candidate heap");
+    int owner=2;p.SetResidents(&owner);p.BeginStep();plan=p.EndStep();
+    Require(plan.size()==1 && plan[0].key==warm,"reconciliation forgot candidate eligibility");
+    p.ObservePrefill(0,{128,1,1},128);
+    Require(p.SelectPrefill(hot,0,{}).key<0,"prefill ignored candidate eligibility");
+}
+
 static void TestDecodeOverlap() {
     fastllm::MoeDecodeOverlapScheduler p;
     Require(p.SelectMisses(0, 10) == 0, "all-hit layer requested PCIe work");
@@ -267,6 +292,67 @@ static void TestDecodeOverlap() {
     computeBound.stagedExpert.Observe(80);
     Require(computeBound.SelectMisses(6, 0) == 2,
             "compute-bound pipeline did not wait for the preceding expert");
+
+    fastllm::MoeDecodeOverlapScheduler decode;
+    Require(decode.SelectDecodeMisses(8, 0) == 0,
+            "decode did not measure the no-upload baseline first");
+    decode.ObserveDecodeCpu(8, 600);
+    Require(decode.SelectDecodeMisses(8, 0) == 4,
+            "decode did not calibrate GPU after the CPU baseline");
+    decode.ObserveDecodeCpu(6, 600); // fixed CPU overhead; linear extrapolation is wrong
+    decode.copiedExpert.Observe(250);
+    decode.stagedExpert.Observe(20);
+    decode.dispatch.Observe(50);
+    Require(decode.DecodeCpuUs(7) == 600 && decode.SelectDecodeMisses(8, 0) == 0,
+            "decode ignored measured CPU costs and chose a slower split");
+    decode.decodeCpu[6] = {};
+    decode.ObserveDecodeCpu(6, 450);
+    decode.copiedExpert = {};
+    decode.copiedExpert.Observe(200);
+    Require(decode.SelectDecodeMisses(8, 0) == 2,
+            "decode serialized host dispatch with already running CPU workers");
+    decode.calls = 126;
+    Require(decode.SelectDecodeMisses(8, 0) == 0,
+            "decode failed to refresh the no-upload baseline");
+    decode.calls = 127;
+    decode.copiedExpert.Observe(2000);
+    for (int i = 0; i < 100; ++i) decode.copiedExpert.Observe(2000);
+    Require(decode.SelectDecodeMisses(8, 0) == 0,
+            "decode did not adapt to slower PCIe");
+    decode.calls = 253;
+    Require(decode.SelectDecodeMisses(8, 0) == 1,
+            "decode stopped probing an unused GPU path");
+
+    fastllm::MoeDecodeOverlapScheduler submission;
+    submission.ObserveDecodeCpu(7, 439);
+    submission.ObserveDecodeCpu(6, 376);
+    submission.copiedExpert.Observe(312);
+    submission.stagedExpert.Observe(40);
+    submission.dispatch.Observe(103);
+    Require(submission.SelectDecodeMisses(7, 1) == 0,
+            "unmeasured submission lost its conservative fallback");
+    submission.decodeLaunch.Observe(28);
+    Require(submission.SelectDecodeMisses(7, 1) == 1,
+            "decode counted overlapping host submission twice");
+    submission.dispatch = {};
+    submission.dispatch.Observe(500);
+    Require(submission.SelectDecodeMisses(7, 1) == 0,
+            "decode ignored a host submission bottleneck");
+    submission.dispatch = {};
+    submission.dispatch.Observe(103);
+    submission.decodeCpu[7] = {};
+    submission.ObserveDecodeCpu(7, 390);
+    submission.decodeCpu[6] = {};
+    submission.ObserveDecodeCpu(6, 330);
+    Require(submission.SelectDecodeMisses(7, 1) == 0,
+            "unsplit pipeline underestimated completion time");
+    submission.gateCopy.Observe(208);
+    submission.gateCompute.Observe(25);
+    Require(submission.SelectDecodeMisses(7, 1) == 1,
+            "decode did not overlap gate computation with down DMA");
+    submission.residentExpert.Observe(1000);
+    Require(submission.SelectDecodeMisses(7, 1) == 0,
+            "split stages ignored preceding resident work");
 }
 
 static void TestParallelOverlap() {
@@ -318,13 +404,80 @@ static void TestParallelOverlap() {
             "parallel planner did not adapt to faster NUMA");
 }
 
+static void TestSharedOverlap() {
+    using Scheduler = fastllm::MoeDecodeOverlapScheduler;
+    Scheduler a, b;
+    Scheduler::Estimate cpu;
+    cpu.Observe(100);
+    for (auto *p : {&a, &b}) {
+        p->residentExpert.Observe(10); p->copiedExpert.Observe(180); p->stagedExpert.Observe(10);
+    }
+    std::vector<Scheduler::SharedRankPlan> plans{{&a, 0, 6, 0}, {&b, 0, 6, 20}};
+    auto owners = Scheduler::AssignSharedMisses(plans, cpu, {1,1,1,1,1,1}, 1);
+    Require(std::find(owners.begin(), owners.end(), 0) != owners.end() &&
+            std::find(owners.begin(), owners.end(), 1) != owners.end() &&
+            std::find(owners.begin(), owners.end(), -1) != owners.end(), "shared planner did not use three compute paths");
+    plans[1].handoffUs = 2000;
+    owners = Scheduler::AssignSharedMisses(plans, cpu, {1,1,1,1,1,1}, 1);
+    Require(std::find(owners.begin(), owners.end(), 1) == owners.end(), "shared planner ignored host-staged result cost");
+    plans[0].capacity = 0;
+    owners = Scheduler::AssignSharedMisses(plans, cpu, {1,1,1}, 1);
+    Require(std::all_of(owners.begin(), owners.end(), [](int r) { return r == -1; }), "unprofitable GPU received work");
+    plans = {{&a, 0, 1, 0}, {&b, 0, 1, 0}, {nullptr, 0, 0, 0}};
+    owners = Scheduler::AssignSharedMisses(plans, cpu, {4,4,4,4}, 1);
+    Require(std::count(owners.begin(), owners.end(), 0) <= 1 && std::count(owners.begin(), owners.end(), 1) <= 1 &&
+            std::find(owners.begin(), owners.end(), 2) == owners.end(), "shared planner exceeded scratch capacity");
+    cpu = {}; cpu.Observe(.01);
+    owners = Scheduler::AssignSharedMisses(plans, cpu, {4,4,4,4}, 1);
+    Require(std::all_of(owners.begin(), owners.end(), [](int r) { return r == -1; }), "shared planner ignored faster NUMA");
+    Require(Scheduler::AssignSharedMisses(plans, cpu, {}, 1).empty(), "resident-only batch generated transfers");
+    Require(Scheduler::AssignSharedMisses({}, cpu, {1,2}, 126) == std::vector<int>({-1,-1}),
+            "missing GPUs did not leave every expert on CPU");
+    Scheduler decode;
+    plans = {{&a, 0, 8, 0}, {&b, 0, 8, 20}};
+    const std::vector<int> eight(8, 1);
+    owners = Scheduler::AssignSharedMisses(plans, decode.cpuExpert, eight, 1, &decode);
+    Require(std::count(owners.begin(), owners.end(), -1) == 8, "decode skipped CPU baseline");
+    for (int n = 1; n <= 8; ++n) decode.ObserveDecodeCpu(n, n * 100);
+    owners = Scheduler::AssignSharedMisses(plans, decode.cpuExpert, eight, 1, &decode);
+    Require(std::count(owners.begin(), owners.end(), 0) > 0 &&
+            std::count(owners.begin(), owners.end(), 1) > 0,
+            "decode did not use both profitable links");
+    owners = Scheduler::AssignSharedMisses(plans, decode.cpuExpert, eight, 126, &decode);
+    Require(std::count(owners.begin(), owners.end(), -1) == 8,
+            "decode did not refresh its CPU baseline");
+    plans = {{&a, 0, 1, 0}, {&b, 0, 1, 20}, {&a, 0, 1, 10}};
+    owners = Scheduler::AssignSharedMisses(plans, decode.cpuExpert, eight, 1, &decode);
+    for (int device=0;device<3;++device) Require(std::count(owners.begin(), owners.end(), device)==1,
+            "shared decode assumes two devices or ignores capacity");
+    plans = {{&a, 0, 8, 0}, {&b, 0, 8, 20}};
+    // A CPU plateau cannot be extrapolated as cost proportional to routes.
+    decode = {};
+    for (int n = 1; n <= 8; ++n) decode.ObserveDecodeCpu(n, 300);
+    owners = Scheduler::AssignSharedMisses(plans, decode.cpuExpert, eight, 1, &decode);
+    Require(std::count(owners.begin(), owners.end(), -1) == 8,
+            "decode split ignored non-linear CPU cost");
+
+    Scheduler coldA, coldB;
+    cpu = {};
+    plans = {{&coldA, 0, 1, 0}, {&coldB, 0, 1, 0}};
+    bool probed[3]{};
+    for (int call = 0; call < 8; ++call) {
+        owners = Scheduler::AssignSharedMisses(plans, cpu, {1}, call);
+        probed[owners[0] + 1] = true;
+    }
+    Require(probed[0] && probed[1] && probed[2], "single-expert calibration starved a GPU or CPU");
+}
+
 int main() {
     TestFrequencyAdmission();
     TestPrefillAdmission();
     TestFrequencyHotSetChange();
     TestFrequencyIndexUpdates();
+    TestFrequencyAvailability();
     TestDecodeOverlap();
     TestParallelOverlap();
+    TestSharedOverlap();
     using fastllm::MoeDecodePolicy;
     // Four alternating experts fit in a global cache, but cannot borrow
     // unused slots from a different record-size partition.
