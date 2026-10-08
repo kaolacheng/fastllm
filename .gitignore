@@ -38,3 +38,8 @@ CLAUDE.md
 /vllm/
 /test/multimodal/*_probe*.png
 /test/multimodal/*_probe*.gif
+ggufDeployTest
+ggufDsv4RulesTest
+iqVecDotCpuTest
+mxfp4DequantCudaTest
+*.bak-probe
