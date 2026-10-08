@@ -3307,6 +3307,14 @@ namespace fastllm {
         if (!MoeCudaCacheRequested()) {
             return false;
         }
+        // With file-backed NUMA storage the retained source layout is
+        // reclaimable page cache, so the load-time headroom that motivated
+        // the delay no longer applies. Registering experts eagerly keeps
+        // anonymous memory low enough to load on 62GiB hosts.
+        const char *mmapDir = std::getenv("FT_NUMA_MMAP_DIR");
+        if (mmapDir != nullptr && mmapDir[0] != '\0') {
+            return false;
+        }
         const std::string mainLayerPrefix = languagePrefix + "layers.";
         return (Qwen4StartsWith(weightName, mainLayerPrefix) ||
                 Qwen4StartsWith(weightName, kMtpExpertPrefix)) &&
