@@ -1,7 +1,14 @@
 #include "numas.h"
+#include <cerrno>
+#include <cstring>
+#include <dirent.h>
+#include <fcntl.h>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <string>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <vector>
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -184,11 +191,128 @@ namespace fastllm {
         free(raw_ptr);
     }
 
-    void* allocate_aligned_numa(size_t size, int node) { 
+    // FT_NUMA_MMAP_DIR: back NUMA expert/weight allocations with sparse files
+    // in the given directory instead of anonymous memory, so a 50+GiB expert
+    // set becomes reclaimable page cache and fits on hosts with less RAM than
+    // the model's full host footprint (e.g. 62GiB machines). Pages stay
+    // NUMA-local via mbind; with FT_PINNED_WEIGHT=0 nothing is pinned, so
+    // cold expert pages can be evicted under memory pressure.
+    struct MmapSlot { void *base = nullptr; size_t mapped = 0; int fd = -1; std::string path; };
+    static std::map<void*, MmapSlot> mmapSlots;
+    static std::mutex mmapSlotsMutex;
+    static int mmapFileCounter = 0;
+
+    // Each run names its files ffl_mmap_<pid>_<node>_<seq>_<size>.bin and
+    // unlinks them at clean exit. A killed or OOM-reaped run skips atexit and
+    // leaves its whole set behind; on a ~300GiB scratch volume a few such
+    // restarts fill the disk and the next run's ftruncate hits ENOSPC,
+    // forcing a fallback to anonymous memory that then OOMs. Sweep the
+    // directory once at first use and drop every file whose pid prefix is not
+    // this process, so a fresh run always starts from a clean volume.
+    static void SweepOrphanMmapFiles(const std::string &dir) {
+        std::string self = "ffl_mmap_" + std::to_string(::getpid()) + "_";
+        DIR *d = ::opendir(dir.c_str());
+        if (d == nullptr) return;
+        int removed = 0;
+        while (dirent *e = ::readdir(d)) {
+            std::string name(e->d_name);
+            if (name.rfind("ffl_mmap_", 0) != 0) continue;
+            if (name.rfind(self, 0) == 0) continue;
+            if (::unlink((dir + name).c_str()) == 0) ++removed;
+        }
+        ::closedir(d);
+        if (removed > 0) {
+            std::cerr << "FT_NUMA_MMAP_DIR swept " << removed
+                      << " orphan file(s) from earlier runs in " << dir << std::endl;
+        }
+    }
+
+    static void CleanupMmapSlots() {
+        std::lock_guard<std::mutex> lock(mmapSlotsMutex);
+        for (auto &entry : mmapSlots) {
+            MmapSlot slot = entry.second;
+            if (slot.base) ::munmap(slot.base, slot.mapped);
+            if (slot.fd >= 0) ::close(slot.fd);
+            if (!slot.path.empty()) ::unlink(slot.path.c_str());
+        }
+        mmapSlots.clear();
+    }
+
+    static void* allocate_mmap_numa(size_t size, int node) {
+        const char *env = std::getenv("FT_NUMA_MMAP_DIR");
+        if (env == nullptr || env[0] == '\0') return nullptr;
+        std::string dir(env);
+        if (dir.back() != '/') dir += '/';
+        size_t alignment = 64;
+        size_t total_size = size + alignment - 1;
+        std::lock_guard<std::mutex> lock(mmapSlotsMutex);
+        static bool atexitRegistered = false;
+        if (!atexitRegistered) {
+            std::atexit(CleanupMmapSlots);
+            SweepOrphanMmapFiles(dir);
+            atexitRegistered = true;
+        }
+        std::string path = dir + "ffl_mmap_" + std::to_string(::getpid()) + "_" +
+                           std::to_string(node) + "_" + std::to_string(mmapFileCounter++) + "_" +
+                           std::to_string((unsigned long long)total_size) + ".bin";
+        int fd = ::open(path.c_str(), O_CREAT | O_RDWR, 0644);
+        if (fd < 0) {
+            std::cerr << "FT_NUMA_MMAP_DIR open failed: " << path << " (" << strerror(errno) << ")\n";
+            return nullptr;
+        }
+        if (::ftruncate(fd, (off_t)total_size) != 0) {
+            std::cerr << "FT_NUMA_MMAP_DIR ftruncate failed: " << path << " (" << strerror(errno) << ")\n";
+            ::close(fd); ::unlink(path.c_str());
+            return nullptr;
+        }
+        void *base = ::mmap(nullptr, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (base == MAP_FAILED) {
+            std::cerr << "FT_NUMA_MMAP_DIR mmap failed: " << path << " (" << strerror(errno) << ")\n";
+            ::close(fd); ::unlink(path.c_str());
+            return nullptr;
+        }
+        if (node >= 0) {
+            struct bitmask *mask = numa_allocate_nodemask();
+            if (mask) {
+                numa_bitmask_setbit(mask, node);
+                ::mbind(base, total_size, MPOL_BIND, mask->maskp, mask->size, 0);
+                numa_free_nodemask(mask);
+            }
+        }
+        uintptr_t addr = reinterpret_cast<uintptr_t>(base);
+        uintptr_t aligned_addr = (addr + alignment - 1) & ~(alignment - 1);
+        mmapSlots[reinterpret_cast<void*>(aligned_addr)] = MmapSlot{base, total_size, fd, path};
+        return reinterpret_cast<void*>(aligned_addr);
+    }
+
+    size_t numa_mapped_size(const void *aligned_ptr) {
+        if (aligned_ptr == nullptr) return 0;
+        std::lock_guard<std::mutex> lock(mmapSlotsMutex);
+        const auto it = mmapSlots.find(const_cast<void*>(aligned_ptr));
+        return it == mmapSlots.end() ? 0 : it->second.mapped;
+    }
+
+    static bool free_mmap_numa(void *aligned_ptr) {
+        std::lock_guard<std::mutex> lock(mmapSlotsMutex);
+        auto it = mmapSlots.find(aligned_ptr);
+        if (it == mmapSlots.end()) return false;
+        MmapSlot slot = it->second;
+        mmapSlots.erase(it);
+        if (slot.base) ::munmap(slot.base, slot.mapped);
+        if (slot.fd >= 0) ::close(slot.fd);
+        if (!slot.path.empty()) ::unlink(slot.path.c_str());
+        return true;
+    }
+
+    void* allocate_aligned_numa(size_t size, int node) {
+        if (std::getenv("FT_NUMA_MMAP_DIR") != nullptr && std::getenv("FT_NUMA_MMAP_DIR")[0] != '\0') {
+            void *mapped = allocate_mmap_numa(size, node);
+            if (mapped) return mapped;
+        }
         if (!numaDetector.canUseNuma) {
             return allocate_aligned(size);
         }
-        
+
         size_t alignment = 64;
         size_t total_size = size + alignment - 1;
         void* raw_ptr = numa_alloc_onnode(total_size, node);
@@ -209,6 +333,9 @@ namespace fastllm {
     }
 
     void free_aligned_numa(void* aligned_ptr, size_t size) {
+        if (aligned_ptr && free_mmap_numa(aligned_ptr)) {
+            return;
+        }
         if (!numaDetector.canUseNuma) {
             free_aligned(aligned_ptr, size);
             return;

@@ -69,7 +69,8 @@ template<int Threads, int CachedItems, int MaxQueries>
 __global__ void LruEnsureKernel(
         ExpertCacheView cache, const int32_t *indices, int keyBase,
         int numExperts, int queries, int32_t *routeSlots,
-        int32_t *missingExperts, int32_t *missingSlots, int32_t *numMissing) {
+        int32_t *missingExperts, int32_t *missingSlots, int32_t *numMissing,
+        const uint8_t *pinMask) {
     __shared__ int keys[MaxQueries];
     __shared__ int resident[MaxQueries];
     __shared__ int firstMissing[MaxQueries];
@@ -97,7 +98,8 @@ __global__ void LruEnsureKernel(
     for (int q = tid; q < queries; q += Threads) {
         bool first = keys[q] >= 0;
         for (int p = 0; p < q; ++p) first &= keys[p] != keys[q];
-        firstMissing[q] = first && resident[q] < 0;
+        firstMissing[q] = first && resident[q] < 0 &&
+            (!pinMask || pinMask[keys[q]]);
         // Dedup hit stores as well as copies; no concurrent idempotent writes.
         if (first && resident[q] >= 0) cache.lastUsed[resident[q]] = tick;
         routeSlots[q] = resident[q];
@@ -184,13 +186,13 @@ template<int Threads, int MaxQueries>
 inline void Launch(ExpertCacheView cache, const int32_t *indices,
                    int keyBase, int numExperts, int queries,
                    int32_t *routes, int32_t *experts, int32_t *slots,
-                   int32_t *missing, cudaStream_t stream) {
+                   int32_t *missing, const uint8_t *pinMask, cudaStream_t stream) {
     if ((cache.slotCount ? cache.slotCount : cache.slots) <= Threads * 16)
         LruEnsureKernel<Threads, 16, MaxQueries><<<1, Threads, 0, stream>>>(
-            cache, indices, keyBase, numExperts, queries, routes, experts, slots, missing);
+            cache, indices, keyBase, numExperts, queries, routes, experts, slots, missing, pinMask);
     else
         LruEnsureKernel<Threads, 0, MaxQueries><<<1, Threads, 0, stream>>>(
-            cache, indices, keyBase, numExperts, queries, routes, experts, slots, missing);
+            cache, indices, keyBase, numExperts, queries, routes, experts, slots, missing, pinMask);
 }
 } // namespace expert_cache_detail
 
@@ -210,14 +212,15 @@ template<int MaxQueries = 64>
 inline bool EnsureExpertCache(ExpertCacheView cache, const int32_t *indices,
                               int keyBase, int numExperts, int queries,
                               int32_t *routes, int32_t *experts, int32_t *slots,
-                              int32_t *missing, int threads, cudaStream_t stream) {
+                              int32_t *missing, int threads, cudaStream_t stream,
+                              const uint8_t *pinMask = nullptr) {
     const int count = cache.slotCount ? cache.slotCount : cache.slots;
     if (cache.slotBegin < 0 || count < queries || cache.slotBegin > cache.slots - count ||
         queries < 1 || queries > MaxQueries || cache.slots < queries ||
         keyBase < 0 || numExperts < 1 || numExperts > INT_MAX - keyBase) return false;
     #define FASTLLM_LRU_LAUNCH(T) \
         expert_cache_detail::Launch<T, MaxQueries>(cache, indices, keyBase, numExperts, \
-                                                  queries, routes, experts, slots, missing, stream)
+                                                  queries, routes, experts, slots, missing, pinMask, stream)
     switch (threads) {
         case 32: FASTLLM_LRU_LAUNCH(32); break;
         case 64: FASTLLM_LRU_LAUNCH(64); break;

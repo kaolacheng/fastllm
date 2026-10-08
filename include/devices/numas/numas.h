@@ -31,4 +31,7 @@ namespace fastllm {
     void free_aligned(void* aligned_ptr, size_t size);
     void* allocate_pinned_numa(size_t size, int node);
     void free_pinned_numa(void* ptr, size_t size);
+    // Size of the FT_NUMA_MMAP_DIR backing mapping for an aligned pointer,
+    // or 0 when the pointer is not a tracked mmap slot.
+    size_t numa_mapped_size(const void *aligned_ptr);
 }
