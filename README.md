@@ -1,478 +1,229 @@
-# FastLLM
+# FastLLM（本地双卡适配分支）
 
-[English](README_EN.md) · [快速开始](#快速开始) · [模型部署指南](#模型部署指南) · [Flash-Next 用户手册](docs/qwen3.8-flash-next/README.md) · [Benchmark](docs/benchmark.md) · [常用参数](#常用参数) · [版本日志](docs/version.md)
+[English](README_EN.md) · [本机完整实测](docs/benchmarks/qwen38_27b_dflash2_t10_tp2.md) · [启动脚本](scripts/qwen27b/README.md) · [上游仓库](https://github.com/ztxz16/fastllm)
 
-FastLLM 是一个面向本地运行和服务部署的高性能大模型推理引擎。核心运行时使用 C++ 实现，不依赖 PyTorch，支持稠密模型与 MoE 模型，并提供 CUDA、ROCm、CPU、NUMA、磁盘混合推理以及多卡张量并行能力。
+本分支在上游 [FastLLM](https://github.com/ztxz16/fastllm) 基础上，补完**本地双卡（2 × Tesla T10，sm75，16 GB）**的部署与调参适配。主线是在这块硬件上跑通 **Qwen3.8-27B W4A4/NVFP4 目标模型 + DFlash2-FP8 投机解码**，并给出一套可复现的显存预算与验收方法。
 
-项目同时提供命令行对话、终端部署向导、WebUI、性能测试工具，以及兼容 OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages 的 API 服务。
+通用引擎介绍、模型清单、完整安装与参数手册不在本文重复：英文版完整保留在 [README_EN.md](README_EN.md)，上游完整中文文档见 git 历史中 `dfe6e661` 之前的 `README.md`，或直接访问[上游仓库](https://github.com/ztxz16/fastllm)。本文只讲本地双卡这条线。
 
-## 核心能力
+相对上游，本分支共 10 个提交、28 个文件、+2864/−195，其中与本线直接相关的改动：
 
-- **新模型快速适配**：当前主线覆盖 Qwen4-Exp / Qwen3.8-Flash-Next、Qwen3.5/3.6/3.8、DeepSeek-V4、Kimi-K3、GLM-5.3-Flash、Dots3-Note 等模型。
-- **大规模 MoE 混合部署**：可将普通层和专家层分别放在 CUDA、CPU、NUMA 或磁盘上，也可按比例组合多种设备，适合显存有限但主机内存或 SSD 容量充足的机器。
-- **多卡与高吞吐服务**：支持张量并行、奇数卡数量、动态批处理、流式输出、Paged KV Cache、前缀缓存、分块 Prefill 和 CUDA Graph。
-- **投机解码**：为匹配的模型提供 MTP、内置或外部 DSpark，以及 DFlash2 等投机解码路径。
-- **多种精度与格式**：支持 Hugging Face Safetensors、FastLLM 导出格式、AWQ 和部分 GGUF；可按模型与硬件使用 FP16、BF16、FP8、NVFP4、MXFP4、INT4、K-Quant 等路径。
-- **完整服务接口**：支持思考内容分离、工具调用、流式响应、缓存命中统计、服务端采样参数和启动进度事件。
-- **可扩展后端**：内置 CPU/CUDA/ROCm 算子，并提供 Triton 可选算子、自定义 Python 模型图和其他加速器后端的源码接入能力。
+- DFlash2 草稿路径支持 TP2 分片，并以逐行激活缩放避免 FP16 GEMM 溢出；
+- 接受率统计改为 EMA 窗口增量，替换原先会打印假值的进程累计口径；
+- KV 显存预算可通过环境变量覆盖，多卡部署可回收不随卡数扩展的固定预留；
+- 多模态前缀缓存与视觉显存优化；
+- 2 × T10 的完整实测数据与本机启停脚本。
 
-> 不同模型、量化格式和硬件后端支持的算子并不完全相同。正式部署前请用目标模型和目标硬件验证精度、显存占用及吞吐。
+## 硬件与目标
 
-## 当前模型能力
-
-下面列出当前开发主线重点，不再把早期模型作为首页介绍内容。
-
-| 模型系列 | 当前重点能力 |
+| 项目 | 值 |
 | --- | --- |
-| Qwen | Qwen4-Exp / Qwen3.8-Flash-Next 文本解码、QSA、PLE n-gram 和 CPU/CUDA/NUMA 混合推理；Qwen3.8-Flash-Next MTP；Qwen3.5/3.6/3.8 MTP 和 DFlash2 |
-| DeepSeek | DeepSeek-V4 / V4-Flash、稀疏注意力、内置 DSpark、多卡 CUDA 与 CPU/NUMA 混合 MoE |
-| Kimi | Kimi-K3、KDA/MLA、外部 DSpark，以及 CUDA、NUMA、CPU/GPU 专家和磁盘专家 |
-| GLM | GLM-5 DSA、GLM-5.3-Flash KDA 与分页缓存、GLM-5.2 量化 KV-B CPU 推理 |
-| 其他 | Dots3-Note、Laguna、HY-V3、Step3.5/3.7、MiniMax-M2、Gemma4 等 |
+| GPU | 4 × NVIDIA Tesla T10，每卡 16384 MiB，sm75 |
+| 卡间互联 | PHB（经 CPU PCIe root complex），Gen3 x8，无 NVLink |
+| 可用显存 | 驱动另占约 454 MiB，单进程上限约 15930 MiB/卡 |
+| 本例布局 | `cuda2/3` 跑生产实例，`cuda0/1` 可跑参数扫描 |
+| 目标模型 | Qwen3.8-27B-Coder390-W4A4（NVFP4 / W4A4），hidden 5120，24 Q 头 / 4 KV 头，head_dim 256，vocab 248320 |
+| 草稿模型 | 同目录 `DFlash2-FP8`，日志报告 `layers=5` |
+| 服务名 / 端口 | `Qwen3.8 27b` / 8092 |
+| 并行与量化 | TP2，FP8 KV Cache，页长 16，chunked prefill 2048 |
 
-Qwen4-Exp / Qwen3.8-Flash-Next 当前不加载视觉权重；Qwen3.8-Flash-Next 可通过 `--mtp` 按需加载 MTP 权重并启用推测解码。早期模型的兼容信息仍可在[支持模型列表](docs/models.md)中查询；最新适配和限制以[版本日志](docs/version.md)为准。
+四卡两两之间只有 PHB 链路，4 卡 TP 的聚合收益有限，因此本例固定用 2/3 卡做 TP2，把另外两卡留作并行验证。
 
-## 快速开始
-
-### 安装
-
-建议在独立的 Python 虚拟环境中安装。预编译包适用于以下常见环境：
-
-| 环境 | 安装命令 | 说明 |
-| --- | --- | --- |
-| Linux + NVIDIA GPU | `python -m pip install -U ftllm` | 包含 Python 接口和常用 CUDA 运行时依赖；驱动需要与 CUDA 运行时兼容 |
-| Windows + NVIDIA GPU | `python -m pip install -U ftllm` | 如果首次安装提示缺少 DLL，请先安装下方的 Windows 依赖包 |
-| Linux + AMD GPU | [ROCm 安装与编译](docs/rocm.md) | 按显卡架构选择构建与安装方式 |
-| CPU-only、特殊架构或其他加速器 | [源码安装](#源码安装) | 可按实际平台选择 CMake 后端 |
-
-Windows 首次安装所需的依赖包：
+## 一键启动
 
 ~~~bash
-python -m pip install https://www.modelscope.cn/models/huangyuyang/fastllmdepend-windows/resolve/master/ftllmdepend-0.0.0.2-py3-none-win_amd64.whl
-python -m pip install -U ftllm
+bash scripts/qwen27b/start_dflash2.sh     # 同机已有其它 ftllm 实例时加 ALLOW_MULTI=1
+bash scripts/qwen27b/stop_dflash2.sh      # 只按 --port 8092 精确匹配，不影响其它实例
 ~~~
 
-如果 Conda 环境出现动态库冲突，可尝试使用 `venv` 创建干净环境。安装或加载失败时先查看 [FAQ](docs/faq.md)。
-
-### 验证安装
-
-下面使用体积较小的 Qwen3-0.6B 做安装冒烟测试；它只是便于快速下载的测试模型，不代表当前模型主线。
-
-~~~bash
-ftllm run Qwen/Qwen3-0.6B
-~~~
-
-最常用的部署入口是 API Server：
-
-~~~bash
-# API Server，默认监听 0.0.0.0:8080
-ftllm server Qwen/Qwen3-0.6B
-
-# 命令行对话
-ftllm run Qwen/Qwen3-0.6B
-
-# WebUI，连接上面的 API Server，默认监听 127.0.0.1:1616
-ftllm webui --api_base http://127.0.0.1:8080/v1
-
-# 浏览器部署启动器；无参数时启动并自动打开本地管理页面
-ftllm
-ftllm launch  # 等价写法
-
-# 终端部署向导
-ftllm tui
-
-# 性能测试
-ftllm bench Qwen/Qwen3-0.6B \
-  --device cuda --input_tokens 512 --output_tokens 128 --batch 4
-~~~
-
-`ftllm`（或 `ftllm launch`）默认仅监听 `127.0.0.1:8000`，并在服务就绪后自动打开浏览器；使用 `ftllm launch --no-browser` 可以关闭自动打开。页面可以从 ModelScope 下载模型、保存启动配置、预览命令，并选择托管 `ftllm server` 或聊天 `ftllm webui`。新增启动项选择本地模型后，会根据模型结构、权重规模以及本机 GPU、内存和 NUMA 拓扑自动推荐 TP、MoE 混合推理与 N-gram 存储参数，也可以手动重新分析或清空可选推理参数。界面支持简体中文和英文，会优先使用上次选择的语言，否则跟随浏览器语言；`ftllm launch` 的终端日志固定使用英文。需要从局域网访问时使用 `ftllm launch --host 0.0.0.0`；终端和 Launcher 页面随后会列出本机、局域网以及网卡上直接配置的公网访问地址（若有）。公网访问还需要放行主机防火墙及云安全组，经过 NAT 时还需配置端口映射；Launcher 不会自动探测 NAT 的公网地址。非本机监听使用未加密 HTTP，请仅在可信网络中使用。它与终端向导共用配置文件；关闭 Launcher 时，由它托管的下载和模型进程也会停止。使用 `ftllm launch --help` 查看其他选项。
-
-Launcher 的「界面主题」提供浅色模式和黑夜模式，默认浅色并记住手动选择。工作室会同步切换主题，保留当前会话和输入草稿。
-
-左侧导航分为「模型管理」和「agent」两组。agent 包含工作室、**DeepSeek Harness**、**OpenCode**、**Codex**、**Claude Code**；后四者可通过分组旁或页面中的“管理”安装、升级和删除独立运行环境，复用现有插件管理。安装无需启动模型，删除保留会话和工作目录。Harness 嵌入原生页面并连接当前模型 API，也可点击“安装并打开 Harness”。无需预装 Node/npm，会话保存位置和部署限制见 [Harness 接入说明](docs/launcher-harness.md)。
-
-同一位置还提供 **OpenCode** 原生网页及 **Codex / Claude Code** 会话页面，支持连接本地模型、工具交互与独立会话。外部工具均不默认安装，需点击各自的安装按钮；OpenCode / Codex 可复用已有命令，Claude Code 使用独立 Agent SDK 运行环境，界面风格接近 Harness。安装、权限和部署说明见 [原生 agent 接入说明](docs/launcher-agents.md)。
-
-Launcher 主导航中的「自定义界面」支持在模型 API 启动后，用自然语言对话定制页面、工作室功能、主界面状态栏和全局皮肤。独立子页面提供会话管理，每个会话分别保留需求、修改摘要与草稿，刷新浏览器后也可恢复；右侧显示整个应用的交互预览，支持连续修改、编辑文件、取消生成和确认应用。自定义内容保存在 `~/.fastllm/plugins`，支持热更新、停用、删除和恢复上一版；核心代码不参与编辑。使用说明与插件格式见 [自定义界面文档](docs/launcher-plugins.md)。
-
-对话、Agent 回复和思考过程支持 Markdown 表格、标题、嵌套列表、任务列表、引用及链接，历史会话也会按相同格式显示。HTML 代码块右上角的「预览」可打开交互页面，支持 HTML、CSS 和内联 JavaScript。预览在隔离环境中运行，仅加载内嵌资源，页面存储在关闭后清空；关闭预览可继续原来的对话。Markdown 解析资源随安装包提供，无需联网下载。
-
-API Server 就绪后，点击「打开工作室」即可在 Launcher 内容区直接使用聊天、历史会话、Markdown、附件、思考过程和智能体功能。模型管理导航始终保留，可随时切换到启动、下载、日志和硬件页面，返回「工作室」后继续当前会话。Launcher 与独立的 `ftllm webui` 共用聊天组件和后端，界面配色、尺寸及语言会适配 Launcher。组件自动连接当前模型并使用启动配置中的 API Key，无需另开 WebUI 服务或端口。会话沿用 WebUI 的本地存储，刷新页面后仍然保留；停止或切换模型时会取消正在运行的 WebUI 任务并清理旧组件。
-
-WebUI 不会在自身进程内加载模型，请先启动 OpenAI 兼容 API Server。WebUI 的可选 `model` 位置参数只用于推导 API 模型名；省略时会从 `/v1/models` 自动发现。
-
-代码分析和联网搜索默认使用 Pi 智能体运行时。Linux x86-64 用户可打开
-`ftllm launch` →「工作室」→「安装 Agent 依赖」，通过 pip 安装
-`ftllm-agent-runtime==0.3.3`，其中已包含 Pi 及 `rg`、`fd` 搜索工具。
-安装需要联网下载约 43 MB，沿用当前 pip 的镜像、代理和缓存配置；不需要管理员权限、Node.js、npm 或 Bun。
-安装包保存在 `${XDG_DATA_HOME:-~/.local/share}/ftllm/agent-runtime/`，不修改系统 Python 包。
-安装期间显示状态，失败后可查看错误并重试；完成后当前工作室即可使用，后续启动也会自动识别。
-已有完整运行时的绿色包无需重复安装。也可在 ftllm 所在的 Python 环境中执行
-`python -m pip install ftllm-agent-runtime==0.3.3` 后重启 ftllm，或按
-[`tools/ftllm_agent_runtime/`](tools/ftllm_agent_runtime/) 中的说明构建配套 wheel。尚未安装时可通过
-`--agent-runtime builtin` 使用原有单轮链路。
-
-Launcher 会自动使用已安装的 Pi 运行时；「新建 Agent」可选择工作目录。通过 `ftllm launch --agent-workspace-root /path/to/projects` 指定可选目录的根路径，默认为用户主目录。Launcher 的目录 Agent 默认启用，本机和远程监听均可使用，例如 `ftllm launch --host 0.0.0.0 --agent-workspace-root /path/to/projects`。使用 `--disable-workspace-agent` 可关闭目录 Agent，同时禁止目录浏览、新建目录 Agent 及继续执行已保存的目录 Agent 任务；普通对话仍可使用。目录 Agent 可修改文件和执行命令，请仅对可信用户开放。运行时缺失或目录 Agent 被关闭时，界面会显示原因。
-
-对于 `run`、`server` 和 `export`，`model` 位置参数既可以是 Hugging Face 仓库 ID，也可以是本地 Hugging Face 模型目录、FastLLM 模型文件或配置文件。例如：
-
-~~~bash
-ftllm server /data/models/my-model --device cuda
-~~~
-
-### 调用 API
-
-启动一个带固定服务名的本地模型：
-
-~~~bash
-ftllm server /data/models/my-model \
-  --model_name local-model \
-  --host 0.0.0.0 --port 8080 \
-  --api_key local-key
-~~~
-
-通过 OpenAI Chat Completions 接口调用：
-
-~~~bash
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H "Authorization: Bearer local-key" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "local-model",
-    "messages": [{"role": "user", "content": "你好，请介绍一下 FastLLM。"}],
-    "stream": false
-  }'
-~~~
-
-服务还提供 OpenAI Responses API 和 Anthropic Messages API。模型支持时，可使用思考内容分离、工具调用和图文输入等能力。
-
-## 模型部署指南
-
-不同模型在注意力结构、MoE 布局、投机解码和量化格式上差异很大。选择目标模型后，请先阅读对应部署指南，再使用后面的通用配置作为补充。
-
-| 模型 | 部署指南 | 推荐配置入口 | Benchmark |
-| --- | --- | --- | --- |
-| Qwen4-Exp / Qwen3.8-Flash-Next | [用户手册](docs/qwen3.8-flash-next/README.md) | 双卡串行 / TP2、专家缓存、固定 GPU 专家层、MTP | [本机实测性能](docs/qwen3.8-flash-next/README.md#performance) |
-| Qwen3.5 / Qwen3.6 / Qwen3.8 | [Qwen 当前模型指南](docs/qwen3.md) | 单卡、TP、混合 MoE、MTP、DFlash2 | [Qwen3 Benchmark](docs/benchmarks/qwen3.md) |
-| DeepSeek-V4 / V4-Flash | [DeepSeek-V4 指南](docs/deepseek.md) | CUDA + NUMA、磁盘专家、TP、内置 DSpark | [DeepSeek-V4 Benchmark](docs/benchmarks/deepseek_v4.md) |
-| Kimi-K3 | [Kimi-K3 指南](docs/kimi_k3.md) | KDA/MLA、混合专家、磁盘专家、外部 DSpark | [Kimi-K3 Benchmark](docs/benchmarks/kimi_k3.md) |
-| Dots3-Note | [Dots3-Note 指南](docs/dots3_note.md) | DSA、长上下文、CUDA + CPU/NUMA | [Dots3-Note Benchmark](docs/benchmarks/dots3_note.md) |
-| GLM-5 / GLM-5.3-Flash | [GLM-5 指南](docs/glm5.md) | DSA/KDA、分页缓存、NUMA、量化 KV-B CPU | [GLM-5 Benchmark](docs/benchmarks/glm5.md) |
-| Laguna | [Laguna 指南](docs/laguna.md) | 多卡 TP、混合 MoE、NVFP4、INT4_GROUP32 | [Laguna Benchmark](docs/benchmarks/laguna.md) |
-
-[Benchmark 索引](docs/benchmark.md) 按模型分别记录测试硬件、完整启动命令、TTFT、Prefill、Decode 和并发吞吐。没有仓库实测的数据会明确标为“待实测”，不会从其他设备或模型外推。
-
-## 典型部署配置
-
-### 多卡张量并行
-
-`--tp 0,1` 显式使用 0、1 号 GPU；`--tp 2` 表示使用前两张可见 GPU；`--tp auto` 自动使用检测到的 GPU。
-
-~~~bash
-ftllm server /data/models/my-model \
-  --device cuda --tp 0,1 \
-  --max_batch 16 --gpu_mem_ratio 0.9
-~~~
-
-### GPU + NUMA 混合 MoE
-
-~~~bash
-ftllm server /data/models/my-moe-model \
-  --device cuda --moe_device numa \
-  --chunked_prefill_size 8192
-~~~
-
-内存不足时还可以把少量专家层放到磁盘，例如 `--moe_device "{'cuda':1,'numa':8,'disk':1}"`。磁盘路径依赖 SSD 随机读取性能，详细配置参见[混合推理指南](docs/mixforward.md)。
-
-### 长上下文与前缀缓存
-
-`--max_context_length`（别名 `--max-context-length`）设置单会话输入与输出合计上限。扩大模型声明窗口时，还需要有效的 `--rope_scaling`（别名 `--rope-scaling`），接受 `yarn` 或 JSON；只缩小窗口时可省略 RoPE 参数。配置在加载时生效，不修改模型的 `config.json`。
-
-例如，将 Qwen3-0.6B 扩展到 65536 token，并开启前缀缓存。其 YaRN 原始长度为 32768，应显式指定，不能用配置声明的 40960 代替：
-
-~~~bash
-ftllm server /data/models/Qwen3-0.6B \
-  --device cuda --max_batch 1 --tokens 65536 \
-  --max_context_length 65536 \
-  --rope_scaling '{"rope_type":"yarn","factor":2,"original_max_position_embeddings":32768}' \
-  --chunked_prefill_size 8192 \
-  --prefix_cache true
-~~~
-
-Qwen3.8-27B-FP8 可以使用已知原始长度的 `yarn` 简写。下面配置双卡、FP4 KV 和 1,000,000 token 的目标窗口，解析得到 original=262144、factor=4：
-
-~~~bash
-ftllm server /data/models/Qwen3.8-27B-FP8 \
-  --tp 2 --kv_cache_dtype fp4 \
-  --max_context_length 1000000 --rope_scaling yarn
-~~~
-
-`--tokens` 是所有会话共享的 KV 池容量，未设置时自动预算。显式目标超过 RoPE 覆盖范围或 warmup 校准容量会启动失败；`/v1/models` 返回实际窗口、模型原声明和用户目标。上述 1M 命令需要足够显存，本机双 24GB 的测试配置无法容纳，完整 1M 输入尚未实测。
-
-当前扩展接入 HF Qwen2、Qwen3、Qwen3.5 布局，以及基于 Qwen3.5 架构的 Qwen3.8；Launcher 高级参数中的「RoPE 扩展」使用相同配置。GGUF、FLM 和自定义 GraphLLM 仅设置长度时保留旧的只缩小行为，暂不支持新的 RoPE 扩展。更多参数、适配范围和验证结果见[上下文扩展说明](docs/context-length-extension-design.md)。
-
-### 投机解码
-
-以下功能只适用于结构和 checkpoint 匹配的模型：
-
-~~~bash
-# 以 Qwen3.5 为例使用内置 MTP，每轮最多配置 8 个 draft token
-ftllm server /data/models/qwen3.5 --mtp 4
-
-# 给不含 MTP 权重的 Qwen3.5 GGUF 挂载独立 MTP 模块
-ftllm server /data/models/qwen3.5.gguf \
-  --device cuda --cuda_embedding \
-  --draft /data/models/qwen3.5-fp8/mtp.safetensors \
-  --draft_tokens 5
-
-# DeepSeek-V4 内置 DSpark
-ftllm server /data/models/deepseek-v4 --dspark 7
-
-# Qwen3.8 + 独立 DFlash2 draft checkpoint
-ftllm server /data/models/qwen3.8 \
-  --tp 2 \
-  --draft /data/models/qwen3.8-dflash2 \
-  --draft_tokens 7
-~~~
-
-`--draft` 会根据 draft checkpoint 自动识别 MTP、DFlash2 或 DSpark。独立 MTP 当前用于 Qwen3.5 GGUF，路径可指向包含 `config.json` 和 `mtp.safetensors` 的目录，也可直接指向 `mtp.safetensors`；省略 `--draft_tokens` 时默认使用 5。DFlash2 的 `--draft_tokens` 表示实际 draft token 数，不包含 anchor token。
-
-DFlash2 的完整配置和验证结果见 [Qwen3.8 DFlash2 文档](docs/dflash2_qwen38_27b_tp2_20260819.md)。
-
-### Qwen4 PLE 磁盘模式
-
-Qwen4-Exp / Qwen3.8-Flash-Next 的 PLE 表较大。主机内存不足时可按需从 checkpoint 读取：
-
-~~~bash
-ftllm server /data/models/qwen4-exp \
-  --device cuda --moe_device numa \
-  --ngram_device disk
-~~~
-
-磁盘模式会降低常驻内存，但增加随机 I/O，建议使用高速 SSD。更多限制见 [Flash-Next 用户手册](docs/qwen3.8-flash-next/README.md)。
-
-## 常用参数
-
-CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依据。下面列出部署中最常用的参数。
-
-### 模型、设备与精度
-
-<a id="3-如何设定运行设备"></a>
-
-| 参数 | 说明 |
-| --- | --- |
-| `model` / `-p, --path` | Hugging Face 仓库 ID、本地 HF 目录、FastLLM 模型文件或配置文件 |
-| `--device` | 主计算设备，常用值为 `cpu`、`cuda`、`numa` |
-| `--vision_device` | Qwen3.5 视觉编码器设备：`auto`（默认）、`cpu`、`cuda`、`cuda:N`；多卡 CUDA 跟随普通 TP，`cuda:N` 不单独覆盖；`cpu` 时视觉塔权重常驻内存，省显存但编码变慢 |
-| `--tp` | CUDA 张量并行设备；支持 `0,1`、`2` 或 `auto` |
-| `--moe_device` | MoE 专家层设备，可使用 `cpu`、`cuda`、`numa`、`disk` 或按比例组合 |
-| `--moe_device_layers` | 仅让最后 N 个 MoE 层使用 `--moe_device`；`-1` 表示全部 |
-| `-t, --threads` | CPU/NUMA 线程数；`-1` 表示自动选择 |
-| `--dtype` | 加载 HF 权重时的权重类型；默认 `auto`，已量化模型通常不应覆盖 |
-| `--moe_dtype` | 单独设置 MoE 权重类型 |
-| `--atype` / `--moe_atype` | 设置普通层和 MoE 层的激活类型 |
-| `--kv_cache_dtype` | KV Cache 类型：`auto`、`float16`、`bfloat16`、`fp8_e4m3` 或 `fp4`，需模型与后端支持 |
-| `--dtype_config` | 动态量化配置文件，参见[动态量化说明](docs/dtype_config.md) |
-| `--triton` | 启用可用的 Triton CUDA 算子 |
-
-### 显存、上下文与调度
+脚本默认值（完整命令见 [启动脚本说明](scripts/qwen27b/README.md) 与[实测篇](docs/benchmarks/qwen38_27b_dflash2_t10_tp2.md)）：
 
 | 参数 | 默认值 | 说明 |
-| --- | ---: | --- |
-| `--gpu_mem_ratio` | `0.9` | 可用于模型与缓存的 GPU 显存比例 |
-| `--moe_cuda_cache` / `--moe-cuda-cache` | `0` | GPU 专家权重缓存预算，例如 `3g`（3 GiB）；`0` 关闭。配合 CUDA 主计算与 CPU/NUMA/disk 专家使用，KV Cache、普通权重及工作区另算；见[专家缓存说明](docs/cuda-expert-cache.md) |
-| `--moe_cpu_cache` / `--moe-cpu-cache` | `0` | `--moe_device disk` 的专家内存缓存总预算，例如 `32g`；可与显存专家缓存同时使用，见[磁盘多级缓存](docs/cuda-expert-cache.md#disk-backed-multilevel-cache) |
-| `--kv_cache_limit` | `auto` | KV Cache 最大使用量 |
-| `--tokens` | 自动 | 用于计算 Paged KV Cache 容量的总 token 数 |
-| `--page_size` | 后端决定 | Paged KV Cache 每页 token 数；多卡默认通常为 16 |
-| `--max_batch` | 自动 | 每轮最多同时推理的请求数 |
-| `--max_context_length` / `--max-context-length` | 自动 | 单会话输入与输出合计上限；HF 显式目标需通过 RoPE 与 KV 容量检查 |
-| `--rope_scaling` / `--rope-scaling` | 沿用模型配置 | RoPE 扩展，接受 `yarn` 或 JSON；仅对已适配的 HF 模型布局生效 |
-| `--chunked_prefill_size` | 关闭/模型决定 | 分块 Prefill 的切片大小，例如 `8192` |
-| `--prefix_cache` | 模型/环境决定 | 是否开启前缀缓存，使用 `true` 或 `false` |
-| `--cuda_slab` | `0` | CUDA 权重 slab 大小（MB）；`0` 为关闭 |
-| `--ngram_device` | `cpu` | Qwen4 PLE 表放在 `cpu` 或 `disk` |
-
-### 解码、模板与工具调用
-
-<a id="工具调用"></a>
-
-| 参数 | 说明 |
-| --- | --- |
-| `--enable_thinking` | 控制模型的思考模板开关，需要模型支持 |
-| `--mtp` | 支持 MTP 的模型每轮生成的 draft token 数，`0` 关闭，当前最大为 8 |
-| `--mtp_fp8_draft_head` / `--mtp-fp8-draft-head` | Qwen3.5 系列多卡 MTP 的 FP8 draft 输出头开关：`1` 开启，`0` 复用原输出头以节省显存，可能降低生成速度；不改变 MTP draft 数。显式参数优先于 `FASTLLM_MTP_FP8_DRAFT_HEAD`，未指定时沿用环境变量，默认开启 |
-| `--dspark` | 启用模型内置 DSpark，并设置每轮 draft token 数 |
-| `--draft` / `--draft_model_path` | 外部 MTP/DSpark/DFlash draft checkpoint；根据配置自动识别算法，MTP 可直接指定 `mtp.safetensors` |
-| `--draft_tokens` | 每轮最多使用的 draft token 数；未指定时读取 draft 配置 |
-| `--tool_call_parser` | 工具调用解析器；默认 `auto` |
-| `--chat_template` | 自定义 Jinja chat template 文件 |
-| `--cache_dir` | 在线模型的本地缓存目录 |
-| `--ori` | 读取部分 GGUF 时指定原模型配置和 tokenizer 目录 |
-| `--mmproj` | Qwen3.5 架构族 GGUF 的配套视觉模块文件；配置要求与示例见 [GGUF 多模态](docs/qwen3.md#gguf-multimodal) |
-
-Qwen4 单卡 CUDA 推理默认将 MTP 草稿专家常驻 GPU，独立于 `--moe_cuda_cache` 的目标模型专家缓存预算，需要额外的草稿专家显存。显存紧张时，可在启动前设置 `FASTLLM_QWEN4_MTP_GPU_EXPERTS=0`，让草稿专家继续使用 MoE 设备配置；TP、多设备流水线和 CPU 推理沿用原有放置策略。
-
-Qwen3.5 系列的 MTP 和 DFlash 草稿支持以下设置。启用相应的草稿算法后，兼容路径默认使用 NVFP4；环境变量可在启动前覆盖默认值：
-
-| 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `FASTLLM_DRAFT_QUANT` | `nvfp4` | `off` 关闭 NVFP4 转换；`nvfp4_head` 只转换独立草稿输出头；`nvfp4` 转换草稿主干和输出头。目标模型输出头保持原权重，不支持的设备、类型或形状保留原路径 |
-| `FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW` | `1` | 允许多行 NVFP4 Linear + SwiGLU 融合，`0` 关闭。当前多行内核仅支持 SM75、FP16 输入、M=2～8，并检查形状、布局和临时空间；其他情况回退 |
-| `FASTLLM_TP_NVFP4_MLP_SWIGLU` | `1` | TP MLP 尝试 NVFP4 Linear + SwiGLU 融合，`0` 关闭；由底层能力检查选择内核，不支持时执行原 Linear + SwiGLU |
-| `FASTLLM_TP_NATIVE_GREEDY` | `1` | Qwen3.5 TP 贪心采样支持原生类型 logits；eager 推测验证省去 FP16→FP32 转换，`0` 关闭。随机采样、返回 logits、Graph 和 GPU token handoff 仍保持 FP32 路径 |
-| `FASTLLM_DFLASH_BATCH_PREFIX_SNAPSHOTS` | `1` | DFlash2 CUDA 批量验证按各请求接受长度恢复线性状态，避免拒绝后的主模型重算。max_batch≤4 使用逐位置状态快照；更大配置保存紧凑激活、批量恢复卷积/GDN 状态，实际 batch 缩小时仍沿用该路径，无 16 路上限。自动预留恢复缓冲与草稿滑窗 KV 显存，相应减少主模型 KV 容量。`0` 回退到完整前缀重算；单请求路径不变。不限定 SM；状态算子已在 SM75 验证到 32 路 |
-| `FASTLLM_MTP_BATCH_SAMPLING` | `1` | Qwen3.5 CUDA MTP 将多请求的草稿采样和主模型拒绝采样合批，直接读取各请求独立的草稿缓存，合并结果回读。混合贪心/采样或不兼容验证长度保留原路径；`0` 恢复逐请求采样。保持采样分布，不保证与逐请求路径随机输出逐 token 相同 |
-| `FASTLLM_MTP_FP8_MARLIN` | `1` | Qwen3.5 TP MTP 在初始化时为符合已有 Marlin 条件的 FP8 草稿分片准备计算布局，避免多行草稿首次调用错过布局转换。不改变权重量化格式，保留现有架构/后端选择；`0` 恢复延迟准备。已在 SM75/TP2 验证 |
-| `FASTLLM_CUDA_GDN_SEQUENCE_PREPARE` | `1` | 批量短序列 GDN 在 K/V 维度均为 128、batch≥4 的 eager 路径预计算 Q/K 归一化与门控系数，避免各状态分块重复计算。保留逐 token FP16 状态舍入及前缀快照；小批量、其他 V 维度和 Graph 保留旧路径。`0` 关闭；已在 SM75/TP2 验证 |
-| `FASTLLM_MTP_DRAFT_TOKEN_IDS` | 未设置 | 可选的单卡或多卡 MTP 草稿词表 token ID 文件，仅在启用 NVFP4 转换时使用；未设置或为 `0` 时使用完整词表。多卡按原词表分片筛选并映射回全局 token ID，对齐填充只重复已有候选。筛选词表只用于贪心草稿，随机采样使用完整输出头，目标模型仍使用完整词表验证 |
-| `FASTLLM_DFLASH_DRAFT_TOKEN_IDS` | 未设置 | DFlash2 贪心请求的可选 token ID 文本清单（空白分隔）。单卡支持原编码 GGUF 或 NVFP4 草稿头，多卡支持 NVFP4；每个连续词表分片至少需有 selector top-k 个候选。对齐填充在 top-k 前移除，选择后恢复原 token ID。完整目标头保留，缩表额外占用草稿头显存，覆盖不足可能降低接受率；启用前应验证任务速度与输出一致性。随机采样使用完整词表；非法或不支持的清单回退完整词表。`FASTLLM_DRAFT_QUANT=off` 时不启用 |
-| `FASTLLM_DFLASH_ATTENTION` | 未设置：SM75 开，其余关 | DFlash FP16 融合滑窗 attention 的统一开关：`0` 关闭，`1` 在支持的设备上开启。要求 head_dim=128、query 数 1～16、query 数×GQA 分组数≤64、query 数≤窗口≤4096，且 FlashInfer 可用；不匹配时回退原路径。SM80 及以上的 Q64 路径尚无实机正确性或速度验证；SM70 及以下始终保持原路径 |
+| `--tp` | 2 | 固定 2/3 卡 |
+| `--max_batch` | 2 | 视觉开启时 batch 4 在 16 GB 卡上不成立 |
+| `--max_context_length` | 262144 | KV 池实测 313872 token，满足该窗口 |
+| `--chunked_prefill_size` | 2048 | |
+| `--page_size` | 16 | 每页 0.26 MB |
+| `--kv_cache_dtype` | fp8 | |
+| `--gpu_mem_ratio` | 1.01 | 见下一节，1.01 是视觉 + batch 2 下 `targetFree` 仍非负的最后一档 |
+| `--prefix_cache` | true | 长前缀复用收益远大于冷路径代价 |
+| `--multimodal` | 开 | 配合 `--image_embedding_cache 4g`（CPU 侧缓存） |
+| 草稿数 | 不传参 | 使用 checkpoint 原生值 7，覆盖时用 `--draft_tokens N` |
+| `FASTLLM_KV_RUNTIME_HEADROOM_MB` | 8 | 校准默认值的显式覆盖 |
+| `FASTLLM_KV_FINAL_SAFETY_MB` | 8 | 同上 |
 
-DFlash2 的动态卷积、QKV 和 Gateup 准备会根据设备、类型和形状自动选择融合实现，不支持时回退到常规算子；TP selector 投影固定在 rank 0 输出头工作流中提前提交。旧开关 `FASTLLM_CUDA_DFLASH_FUSED_CONV`、`FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE`、`FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE` 和 `FASTLLM_DFLASH_TP_EARLY_SELECTOR` 已移除，设置它们不再影响执行路径。
+启动后就绪判据是日志中的四行：`[Qwen3.5 DFlash2] enabled: layers=5, drafts_per_step=7, ...`、`[Vision] Multimodal workspace ready: ...`、`KV Cache Token limit: 313872 tokens (pageLen=16).`、以及每卡的 `freeAfterWarmup=... targetFree=...`。
 
-未覆盖的设置使用表中默认值；内核本身的能力限制仍然有效。单卡和多卡均可使用草稿 NVFP4；多卡在切分后转换符合条件的分片。MTP 限于稠密模型、FP16 计算；DFlash 的量化 Linear 通过 FP16 适配后恢复原激活类型。量化会影响草稿接受率，独立输出头和视图副本也会改变显存占用，不保证所有模型提速；目标模型权重与完整词表验证保持原样。可用 `FASTLLM_DRAFT_QUANT=off` 保留原草稿精度，既有多卡 FP8 草稿输出头开关仍有效。
+## KV 池预算与 targetFree 判据
 
-NVFP4 小矩阵解码默认在 SM75、68 个 SM 的设备（如 RTX 2080 Ti）上启用已验证的调优，覆盖 M=1～8、N×K 为 17408×5120 的融合 SwiGLU，以及 5120×8704、5120×3072 的 Linear。运行时还需满足线程块驻留条件；其他架构、形状和原始 M>8 的 prefill 保持原路径。可用 `FASTLLM_CUDA_NVFP4_SM75_DECODE_TUNE=0` 关闭，`1` 显式开启全部，或用 `linear` / `swiglu` 仅开启对应部分。多行 SwiGLU 的融合入口仍由 `FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW` 单独控制。
+`gpu_mem_ratio` 的作用是把显存校准中重复计入的 runtime reserve 让给 KV 池：每 +0.01 约 +9000 token，同时多吃约 145 MB/卡。校准结束时每卡会打印 `freeAfterWarmup` 与 `targetFree`：
 
-### API Server
-
-| 参数 | 默认值 | 说明 |
-| --- | ---: | --- |
-| `--host` | `0.0.0.0` | 监听地址 |
-| `--port` | `8080` | Server 端口；WebUI 默认端口为 1616 |
-| `--model_name` | 自动 | API 中校验和返回的部署名称 |
-| `--api_key` | 空 | 非空时开启 Bearer API Key 校验 |
-| `--temperature` / `--top_p` / `--top_k` | 模型默认 | 覆盖服务端默认采样参数 |
-| `--repeat_penalty` | 模型默认 | 覆盖重复惩罚参数，也支持 `--repetition_penalty` |
-| `--hide_input` | 关闭 | 不在服务日志中显示请求内容 |
-| `--startup-progress` | `off` | 设置为 `ndjson` 时向 stderr 输出模型加载与就绪事件 |
-
-查看完整参数：
-
-~~~bash
-ftllm --help
-ftllm server --help
-ftllm bench --help
-ftllm download --help
+~~~text
+GPU 0: freeAfterWarmup=1.54 GB, targetFree=0.50 GB, localKVPerPage=0.26 MB, delayedPagedReserve=0.02 MB/page, pageLimit=19617.
 ~~~
 
-## 模型格式、下载与导出
+**判据：两卡 `targetFree` 都必须为正，且经验上不小于 0.5 GB。** 它表示"扣掉按最大 batch 预留的 runtime cache 之后还剩多少"，为负即说明本次校准已经超额分配，真实负载下会崩。
 
-### 支持的输入格式
+开视觉、batch 2（最终档）实测：
 
-- Hugging Face 原始 Safetensors 权重，包括模型自带的 FP16、BF16 或 FP8 权重。
-- 已量化的 AWQ 模型。
-- FastLLM 导出的定精度或动态量化模型。
-- 部分 GGUF 格式；已适配的模型可直接读取内置配置和 tokenizer，也可通过 `--ori` 指定原模型目录。Qwen3.5 架构族的 GGUF 使用独立视觉模块时，还需指定 `--mmproj` 并提供匹配的视觉配置，见 [GGUF 多模态](docs/qwen3.md#gguf-multimodal)。
+| gpu_mem_ratio | KV 池 | targetFree rank0 / rank1 | 2 并发 × 8k 预填充 | 压后余量 rank0 / rank1 |
+| ---: | ---: | --- | --- | --- |
+| 1.00 | 302944 | +0.67 / +0.33 GB | 2/2 全 200 | 1018 / 1252 MiB |
+| **1.01** | **313872** | **+0.50 / +0.16 GB** | **2/2 全 200** | **322 / 666 MiB** |
+| 1.02 | 320912 | +0.34 / −0.01 GB | 2/2 全 200 | 214 / 538 MiB |
+| 1.04 | 338912 | 0.00 / −0.34 GB | 0/2，OOM | 12 / 334 MiB |
+| 1.06 | 360736 | −0.33 / −0.68 GB | 0/2，OOM | 22 / 50 MiB |
 
-量化格式是否可用取决于模型结构、设备和对应 kernel。首次部署建议保留 `--dtype auto`；对于已经量化的 checkpoint，不要再次指定在线量化类型。
+1.02 已是擦边档（rank1 的 `targetFree` 为 −0.01，压后余量只剩 214 MiB），1.04 起必崩，因此 1.01 作为最终配置。关视觉、batch 4 的对照档为 1.00 → 318192 token、1.02 → 336176 token，均通过 4 并发 × 8k。
 
-### 下载模型
+脚本里设的 8 MB 是对校准默认值的覆盖：
 
-~~~bash
-ftllm download <repo-id> --local-dir /data/models/model-name
+| 环境变量 | 校准默认值 |
+| --- | --- |
+| `FASTLLM_KV_RUNTIME_HEADROOM_MB` | `min(max(512 MB, total/100), 2 GB)`，再被 `available/4` 兜底；设了覆盖值时取 `min(覆盖值, available/4)` |
+| `FASTLLM_KV_FINAL_SAFETY_MB` | `min(max(128 MB, total/200), 512 MB)` |
+
+这两项是不随卡数扩展的固定预留，多卡部署里收紧它们可以把显存让给 KV 池。
+
+## 准入测试协议
+
+显存是否站得住，必须用**并发填满 `max_batch` 的长预填充**压过一遍，再看稳态余量。单条长请求压不出峰值：早期在 1.08 与 1.12 档就是用单请求验的，启动后看着还有 814 MB 空闲，真实负载下只剩 170 MB，最终 OOM。本线的两次 OOM 也都源于此。
+
+OOM 签名（都发生在 prefill 激活分配上）：
+
+~~~text
+Error: CUDA error when allocating 20 MB memory on device 0! gpuFree: 9 MB / 15930 MB.
+FastLLM fatal CUDA allocation error: Error: cuda malloc failed in Data::MallocSpace.
+  requestBytes = 20971520, dataType = float16, dims = [1, 2048, 5120].
 ~~~
 
-只下载配置和 tokenizer 文件时可以排除权重：
+更高档位还见过 `requestBytes = 35651584`（`dims = [1, 2048, 8704]`）与 `cudaErrorMemoryAllocation at fastllm-cuda.cu:5404`。
 
-~~~bash
-ftllm download <repo-id> \
-  --exclude "*safetensors*" \
-  --local-dir /data/models/model-config
+## 接受率与步率的正确口径
+
+早期版本的 `pos_accept_rate` 是进程累计计数、永不归零，从日志反算出的接受长度是假的：同一服务打印 3.30~4.19，而按窗口统计的真值为 6.19~6.45。现改为"窗口增量 + 指数移动平均"（α = 0.3，窗口 64 次验证）：
+
+~~~text
+[Qwen3.5 DFlash2] pos_accept_rate(EMA)=[64.80%, 28.84%, 16.30%, 7.52%, 4.83%, 3.48%, 1.07%] accept_len=2.27 tokens/step (window=64 validations, total=256 validations).
 ~~~
 
-### 导出模型
+- `accept_len = 1 + Σ pos_accept_rate`，即每步平均产出 token 数；
+- `steps/s = 客户端可见吞吐 ÷ accept_len`。
 
-在线量化会增加每次启动的加载时间。可以预先导出 FastLLM 格式：
+它是**混合窗口值**：一个进程里混跑多类任务时会被接受率最低的那类拉低。上面那条 2.27 来自带图请求，不能与纯文本长生成（4.3~6.5）直接比较；要得到每类任务各自的口径，需每档只跑一类并跑够窗口长度。此外单次 `temperature 1.0` 的重复测量散布明显（同一提示词出现过 3.47 / 5.67 / 6.19 / 6.45），单次结果不足以作结论。
 
-~~~bash
-ftllm export /data/models/source-model \
-  -o /data/models/source-model-int4 \
-  --dtype int4 -t 16
+## 草稿数扫描
+
+条件：`temperature 0.5`、`max_context_length 5000`、`max_tokens 512`，每类任务 3 遍取中位。三类任务为"从 0 数到 1000"（高可预测）、写 Triton GEMV 内核（中）、写散文（低）。
+
+| 草稿数 | 数数（高） | GEMV（中） | 散文（低） | accept_len |
+| ---: | ---: | ---: | ---: | ---: |
+| 3 | 99.6 | 82.4 | 40.0 | 1.55~1.62 |
+| 5 | 84.9 | 71.2 | 43.3 | 1.58~1.60 |
+| **7（原生）** | **112.2** | **78.4** | 39.2 | **1.71** |
+| 9 | 112.2（原始值 112 / 112 / 141） | 待实测 | 待实测 | 待实测 |
+| 11 | 94.4 | 77.6 | 39.4 | 1.69 |
+
+单位为客户端可见 token/s。结论：**默认的 7 最优**；11 明显回落（位置 8 之后接受率只剩约 1%，多出的草稿只增加延迟）；3 与 5 都不如 7；9 在数数上打平但未超过。散文在 39~43 之间基本不随草稿数变化——低可预测内容里大部分草稿被拒，多猜的收益被延迟抵消。
+
+## 前缀缓存
+
+`--prefix_cache true` 为默认。同前缀 1855 token 的对照实测：
+
+| 请求 | 时延 | prompt token |
+| --- | ---: | ---: |
+| 冷启动 | 2.79 s | 1855 |
+| 同前缀复用 | 0.23 s | 1855 |
+
+即 11.9× 提升，日志三行对应播种与复用：
+
+~~~text
+[Qwen3.5 DFlash2] long prefill cache seeded: tokens=1855, chunk=256.
+[Qwen3.5 DFlash2] prefix cache restored: tokens=1792, draft_kv_tokens=1792.
+[Qwen3.5 MTP] prefix cache hit: tokens=1792.
 ~~~
 
-MoE 模型可以分别设置普通层和专家层精度：
+`draft_kv_tokens=1792` 表示草稿模型 KV 一并恢复，复用请求无需重新为草稿热身。代价在冷路径：开启后冷 prefill 按 `chunk=256` 播种缓存，本次 1855 token 冷启动约 665 token/s，低于关闭时的水平。它偏向"多轮或多请求共享长前缀"的用法；若流量全是互不相同的短请求，会净亏一点预填充速度。
 
-~~~bash
-ftllm export /data/models/source-moe \
-  -o /data/models/source-moe-mixed \
-  --dtype float16 --moe_dtype int4 -t 16
+## 视觉
+
+视觉用 `--multimodal` 开启，配合 `--image_embedding_cache 4g`（CPU 侧 embedding 缓存，按需分配）。`--mmproj` 只支持 Qwen3.5 家族的 GGUF 模型，safetensors 部署不用它；`--vision_device` 不指定时视觉塔跟随 TP 设备。工作区在 KV cache **之前**预热，因此池子会自动缩水：
+
+~~~text
+[Vision] Multimodal warmup before KV cache: cuda:0, heads=8, max patches=2048, fixed workspace=192.00 MiB.
+[Vision] Multimodal workspace ready: cuda:0, peak=45.16 MiB, live=0.00 MiB; remaining memory is available for KV cache.
 ~~~
 
-动态量化配置见[动态量化说明](docs/dtype_config.md)。
+固定工作区 192.00 MiB/卡，实测峰值仅 45.16 / 45.10 MiB——预留量远大于实际峰值。但同档位下池子仍明显变小：关视觉 batch 4 / ratio 1.02 为 336176（cuda2/3），开视觉 batch 4 / ratio 1.02 实测 252400（cuda0/1），已低于 262144，该组合不可用（两组不在同一卡对，作方向性参考）。
 
-## 源码安装
+单张 PNG 图片请求实测：
 
-源码构建需要 C++17 编译器、Make 和 CMake；建议 GCC/G++ 9.4+、CMake 3.23+。Linux NUMA 构建通常还需要 `libnuma-dev`。CUDA 构建请预先安装兼容的 CUDA Toolkit 和 NCCL。
+| 项目 | 值 |
+| --- | --- |
+| 视觉 feature token | 400 |
+| HTTP / 时延 | 200 / 14.5 s |
+| prompt / completion | 461 / 639 token |
+| embedding 缓存 | 未命中后写入 8192000 / 4294967296 字节 |
+| accept_len（EMA） | 2.27、2.17 |
 
-~~~bash
-# Ubuntu/Debian 基础依赖
-sudo apt-get install -y build-essential cmake libnuma-dev
+带图请求的接受长度显著低于纯文本（4.3~6.5），因为草稿模型是纯文本路径，预测不了对图像内容的描述。视觉 + 投机解码在 sm75 上的其它组合（更大 batch、更大 ratio）未验证。
 
-# NVIDIA CUDA
-bash install.sh -DUSE_CUDA=ON \
-  -DCMAKE_CUDA_COMPILER="$(command -v nvcc)"
+## 踩坑与限制
 
-# 指定 CUDA 架构，例如 Ada 使用 89
-bash install.sh -DUSE_CUDA=ON -DCUDA_ARCH=89 \
-  -DCMAKE_CUDA_COMPILER="$(command -v nvcc)"
+- **不要用启动后的空闲显存判断 ratio**。KV 池按用量逐步分配，1.08 档刚启动看着还有 814 MB 余量，真实负载下只剩 170 MB。必须压过一遍再看稳态余量。
+- **以 `targetFree` 为准**。两卡都要为正、经验上不小于 0.5 GB；负数代表本次校准已超额分配，实测 1.04 与 1.06 在 2 并发 × 8k 下 0/2 全挂。
+- **准入测试必须并发填满 `max_batch`**。单条长请求压不出 prefill 激活峰值。
+- **`--draft_tokens` 只接受正整数**。默认 `-1` 表示用 checkpoint 原生值，此时必须整个省略该参数；传 `-1` 会让 argparse 直接报错退出，服务根本起不来。
+- **不要在服务运行时覆盖被映射的 `.so`**，会让进程静默退出（日志停在一条正常请求之后，无任何报错）。更新引擎文件要先写临时文件再 `mv` 原子替换，运行中的进程继续持有旧 inode。
+- **`nohup` 不防 SIGTERM**。启动包装脚本被中断时，同进程组的服务会一起收到 SIGTERM，日志表现为正常的 graceful shutdown。需要真正后台常驻用 `setsid nohup`。
+- **`--enable_thinking true` 会吃掉整个输出预算**。`max_tokens` 偏小时返回 HTTP 200 但 `content` 为空（内容全在思考里），容易误判成服务故障。
+- **视觉与 batch 4 在 2 × T10 上不可行**，需降到 batch 2；开视觉后必须重新确认 `KV Cache Token limit` 仍不小于 `max_context_length`。
+- **残留实例会互相干扰**：同卡上并存两个实例时，显存校准会互相抢显存并污染 `targetFree`，参数扫描务必确认卡已释放。
+- **边界**：全部数据来自单机 4 × T10（sm75 / 16 GB / PHB、无 NVLink），`temperature 0.5` 与 `1.0` 混用，单次结果噪声较大。换硬件、换模型或换量化格式都需重新校准，不要直接外推。
 
-# CPU-only
-bash install.sh
-~~~
+## 本分支改动清单
 
-更多平台说明：
+**一、DFlash2 草稿路径**
 
-- [ROCm 编译与 wheel 打包](docs/rocm.md)
-- [TFACC 平台](docs/tfacc.md)
-- [示例程序、Android 和其他平台](example/README.md)
-- [编译与运行 FAQ](docs/faq.md)
+- `bcca7786`：`dflash.fc` 与 attention q/k/v 加入张量并行（行并行 + output-gather，关闭两级融合保证头边界对齐）；新增 `RunDFlashTpLinear` 统一分片 GEMM 入口；修正 TP 预留中 fake 视图重复计费；草稿残差改 FP32 累加（BF16 会吞掉 1e-5 级注意力贡献）；`lm_head` 逐行缩放覆盖 NVFP4 各布局。`fc` 必须按输出维行并行——按输入维列并行会被框架的 `input.IsTensorParallelSharded()` 挡住并退回兜底路径，把整块约 250 MB 搬回 root（实测约 2.5 份、618.8 MB），显存不对齐且易 OOM。
+- `dd900d07`：逐行激活缩放保护 FP16 GEMM 溢出。NVFP4 GEMM 为 FP16 进出，草稿 GEMM 输出峰值可超 65504 产生 inf，污染 RMSNorm 并让 selector 越界；按行取 absmax 推出 2 的幂 scale，scale 全程留在设备上，不破坏 CUDA graph 捕获。
+
+**二、接受率统计口径**
+
+- `bcca7786`：MTP / DFlash2 接受率日志改为 EMA 窗口增量，替换原先的进程累计计数。
+
+**三、KV 显存预算**
+
+- `80005d44`：新增 `include/utils/cuda_cache_budget.h`，`FASTLLM_KV_RUNTIME_HEADROOM_MB` 与 `FASTLLM_KV_FINAL_SAFETY_MB` 可覆盖校准默认值。
+
+**四、多模态前缀缓存与视觉显存**
+
+- `bcca7786`：按图片内容哈希键比对快照，无键输入（如视频）拒绝记录与复用；恢复边界必须越过全部视觉 token，文本尾巴走续写路径并按全序列 M-RoPE 切位置；`thread_local` 钩子在分块边界（页对齐 + 状态一致）安全记录快照。视觉侧：工作区在 KV 之前预热、激活 arena 按 chunk 尺寸收缩、`FASTLLM_QWEN35_MM_WORKSPACE_MARGIN_MB` 可调余量、`FASTLLM_QWEN35_SKIP_VISION` 供纯文本部署跳过视觉塔权重。新增 `include/utils/qwen35_mm_record_hook.h`。
+
+**五、诊断探针清理**
+
+- `dfe6e661`：移除 MoE 专家缓存与 NVFP4 规划路径的一次性 `[DBG-*]` / `[EP-DBG]` 打印、Qwen3.5 前缀缓存与结构探针及其环境开关、basellm 的探针打印与计数变量、`model.cpp` 的 deviceMap 打印，共删除 409 行；保留 staged fill 信息、错误上报、内存检查堆栈诊断与 `pos_accept_rate` 等运行信息日志。
+
+分支还包含与本设备布局无关的合并与算子工作：`13c9b9ce`（合并上游 82 个提交）、`89b36ca9`（NVFP4 packed E4M3 scale 布局）、`dcc65774`（GGUF/IQ/MXFP4 算子验证测试）、`a0e51574`、`ebd29791`、`291974d8`、`6135be93`、`77067c59`。
 
 ## 文档导航
 
-| 主题 | 文档 |
+| 文档 | 内容 |
 | --- | --- |
-| 发布说明 | [稳定版日志](docs/version.md) · [Nightly 使用](docs/nightly.md) · [Nightly 日志](docs/nightly_changelog.md) |
-| 模型部署 | [Qwen3.8-Flash-Next](docs/qwen3.8-flash-next/README.md) · [Qwen3.5/3.6/3.8](docs/qwen3.md) · [DeepSeek-V4](docs/deepseek.md) · [Kimi-K3](docs/kimi_k3.md) · [Dots3-Note](docs/dots3_note.md) · [GLM-5](docs/glm5.md) · [Laguna](docs/laguna.md) |
-| 混合推理 | [GPU、NUMA 与磁盘混合部署](docs/mixforward.md) |
-| 性能与验证 | [按模型查看 Benchmark](docs/benchmark.md) |
-| 量化 | [动态量化配置](docs/dtype_config.md) |
-| 扩展开发 | [Python 自定义模型](docs/custom.md) · [自定义算子](docs/custom_op.md) |
-| 平台与排错 | [ROCm](docs/rocm.md) · [TFACC](docs/tfacc.md) · [FAQ](docs/faq.md) |
+| [docs/benchmarks/qwen38_27b_dflash2_t10_tp2.md](docs/benchmarks/qwen38_27b_dflash2_t10_tp2.md) | 本机完整实测：KV 池档位、准入测试、草稿数扫描、前缀缓存、视觉、回归清单 |
+| [docs/benchmarks/qwen38_27b_dflash2.md](docs/benchmarks/qwen38_27b_dflash2.md) | 上游 DFlash2 Benchmark（含其它设备布局） |
+| [docs/benchmark.md](docs/benchmark.md) | Benchmark 索引 |
+| [scripts/qwen27b/README.md](scripts/qwen27b/README.md) | 启动脚本用法、默认参数表、仓库外依赖 |
+| [docs/](docs/) | 上游通用文档目录（参数、模型、后端、算子等） |
+| [README_EN.md](README_EN.md) | 上游英文 README |
 
-## 社区与贡献
+## 复现与回归检查清单
 
-欢迎通过 [GitHub Issues](https://github.com/ztxz16/fastllm/issues) 报告问题，通过 [Pull Requests](https://github.com/ztxz16/fastllm/pulls) 参与开发。
-
-部署交流 QQ 群：`831641348`
-
-用户交流群（使用、部署）：
-
-<img src="docs/wechat_group0.jpg" width="220" alt="FastLLM 用户交流群二维码">
-
-社区开发群（贡献、开发讨论）：
-
-<img src="docs/develop-group.png" width="220" alt="FastLLM 社区开发群二维码">
-
-项目采用 [Apache License 2.0](LICENSE)。
-
-## 参考代码和文章
-
-FastLLM 的实现参考或使用了以下开源项目与文章中的思路或代码：
-
-- [PyTorch](https://github.com/pytorch/pytorch)：底层算子实现思路。
-- [Transformers](https://github.com/huggingface/transformers)：模型结构与参考实现。
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) 和 [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)：GGUF 量化格式与 kernel。
-- [KVMem / kvmem-llama.cpp](https://github.com/kvmem/kvmem-llama.cpp)：分层 KV 缓存与内容检索的设计参考，包括固定 GPU 工作集、主机 KV 备份和 pre-RoPE mean-K 检索。FastLLM 接入说明见 [KVMem 文档](docs/kvmem.md)。
-- [FlashInfer](https://github.com/flashinfer-ai/flashinfer)：Attention、MLA 等算子。
-- [TurboMind / LMDeploy 的 GEMM 内核](https://github.com/InternLM/lmdeploy/tree/main/src/turbomind/kernels/gemm)：仓内 `third_party/turbomind` 的 SM70 s884（`SM70_MMA_884` / HMMA 8x8x4）核心由其源码移植，并在其上接入 AWQ INT4、块缩放 FP8 与 NVFP4 Linear。
-- [1Cat-vLLM 的 SM70 TurboMind 适配](https://github.com/1CatAI/1Cat-vLLM/tree/main/csrc/sm70_turbomind)：AWQ 接入及 FP8/NVFP4 类型、布局和小批量 tactic 的参考来源；FastLLM 侧另行实现了无 Torch 的原始指针桥接、模型权重格式转换、非对齐 padding、回退和调度。
-- [KTransformers](https://github.com/kvcache-ai/ktransformers/blob/main/csrc/ktransformers_ext/cpu_backend/backend.cpp)：MoE 动态线程调度；另见[思路介绍](https://zhuanlan.zhihu.com/p/1900318746402329329)。
-- [Lvllm](https://github.com/guqiong96/Lvllm/blob/main/csrc/lk/moe.cpp)：NUMA MoE 动态调度。
-- [FreeToken](https://github.com/FlashML-org/FreeToken)：CUDA 专家缓存及相关混合推理优化的设计参考，包括 GPU 端路由与 LRU 缓存管理、主机专家权重按需回填，以及 CUDA Graph 兼容的执行流程。具体实现与扩展方式见 [CUDA 专家缓存说明](docs/cuda-expert-cache.md)。
-- [vLLM](https://github.com/vllm-project/vllm/tree/main/vllm/entrypoints/openai/tool_parsers)：工具调用解析。
-- [json11](https://github.com/dropbox/json11)：JSON 构造与解析。
-
-感谢所有开源贡献者。如发现遗漏的代码来源或引用，请通过 Issue 告知。
+1. 用上文命令启动，确认进程起来且 `/v1/models` 返回 200。
+2. 检查日志：`[Qwen3.5 DFlash2] enabled: layers=5, drafts_per_step=7`、`[Vision] Multimodal workspace ready`、`KV Cache Token limit: 313872 tokens`、两卡 `freeAfterWarmup / targetFree`。
+3. 通过标准：KV 池 ≥ `max_context_length`；两卡 `targetFree` 为正（期望约 +0.50 / +0.16 GB）。
+4. 准入测试：并发 `max_batch` 条 8k 预填充全部 HTTP 200，压后余量 rank0 不低于约 300 MiB；任一条 000 或日志出现 `cuda malloc failed` 即未通过。
+5. 视觉回归：发一张图片，确认出现 `[Vision] ... after encode: ... feature_tokens=` 与 `Image embedding cache` 行，且返回 200。
+6. 前缀缓存回归：同一长前缀连发两次，第二次应出现 `prefix cache restored` 与 `prefix cache hit`，时延数量级下降。
+7. 接受率口径：确认日志为 `pos_accept_rate(EMA)=[...] accept_len=... (window=... total=...)` 形式。
