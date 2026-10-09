@@ -257,7 +257,6 @@ namespace fastllm {
 #endif
         this->deviceMap = GetDeviceMap();
         this->moeDeviceMap = GetMoeDeviceMap();
-        { std::cerr << "[DBG] deviceMap:"; for (auto &kv : this->deviceMap) std::cerr << " " << kv.first << "=" << kv.second; std::cerr << " | moeDeviceMap:"; for (auto &kv : this->moeDeviceMap) std::cerr << " " << kv.first << "=" << kv.second; std::cerr << std::endl; }
         this->layeredMoeDeviceMap = GetLayeredMoeDeviceMap();
         this->moeDeviceLayers = GetMoeDeviceLayers();
         this->ngramDevice = GetNgramDevice();
@@ -329,31 +328,18 @@ namespace fastllm {
     bool basellm::PrepareMoeCudaCache(
             const std::vector<std::vector<Data *>> &layerWeights) {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
-        std::fprintf(stderr,
-            "[Fastllm][DBG-mcpp] PrepareMoeCudaCache: cacheBytes=%lld "
-            "layerWeights=%zu\n",
-            (long long)fastllm::GetMoeCudaCacheBytes(), layerWeights.size());
         if (!FastllmCudaMoeCacheRequested() || layerWeights.empty()) {
-            std::fprintf(stderr,
-                "[Fastllm][DBG-mcpp] silent false: requested=%d empty=%d\n",
-                (int)FastllmCudaMoeCacheRequested(),
-                (int)layerWeights.empty());
             return false;
         }
         std::vector<FastllmCudaMoeCacheLayer> layers;
         layers.reserve(layerWeights.size());
         bool allNuma = true;
-        int skipped = 0;
         for (int layer = 0; layer < static_cast<int>(layerWeights.size()); ++layer) {
             const std::string device = SelectMoeDeviceForLayer(layer);
             // GPU-resident layers keep their own expert layout. Register only
             // host tables, including when the first layer resides on CUDA.
             const bool numa = device == "numa" || device.compare(0, 5, "numa:") == 0;
-            if (device != "cpu" && !numa) { skipped++; continue; }
-            if (layer < 4 || layer >= (int)layerWeights.size() - 2)
-                std::fprintf(stderr,
-                    "[Fastllm][DBG-mcpp] layer %d device=%s wsize=%zu\n",
-                    layer, device.c_str(), layerWeights[layer].size());
+            if (device != "cpu" && !numa) continue;
             allNuma = allNuma && numa;
             const auto &weights = layerWeights[layer];
             // NVFP4_BLOCK_16_E4M3_PACKED experts belong to the "glm5" format
@@ -369,9 +355,6 @@ namespace fastllm {
                 0.0f,
                 packedNVFP4});
         }
-        std::fprintf(stderr,
-            "[Fastllm][DBG-mcpp] layers kept=%zu skipped=%d allNuma=%d\n",
-            layers.size(), skipped, (int)allNuma);
         if (layers.empty()) return false;
         std::function<void()> registerNumaWeights;
 #ifdef USE_NUMAS

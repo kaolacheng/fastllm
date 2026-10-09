@@ -1058,15 +1058,6 @@ bool ValidateWeightPair(fastllm::Data *gate, fastllm::Data *down,
     }
 
     observed.weightType = gate->dataType;
-    { static int dbgw = 0; if (dbgw++ < 2) { std::fprintf(stderr,
-        "[Fastllm][DBG-wpair] gate dtype=%d dscale=%zu dblockM=%d dblockK=%d "
-        "dims=[%ld,%ld] cpu=%d numas=%zu | down dtype=%d dscale=%zu "
-        "dblockM=%d dims=[%ld,%ld] numas=%zu\n",
-        (int)gate->dataType, gate->scales.size(), gate->blockM, gate->blockK,
-        (long)gate->dims[0], (long)gate->dims[1], (int)(gate->cpuData != nullptr),
-        gate->numasData.size(), (int)down->dataType, down->scales.size(),
-        down->blockM, (long)down->dims[0], (long)down->dims[1],
-        down->numasData.size()); } }
     if (gate->dataType == fastllm::DataType::NVFP4_BLOCK_32_E8M0 &&
         ((gate->dims[1] % 32) || (down->dims[1] % 32) ||
          gate->blockM != 32 || down->blockM != 32)) return false;
@@ -2020,17 +2011,10 @@ bool FastllmCudaPrepareMoeCache(
     if (layers == nullptr || layerCount <= 0 ||
         layers[0].weights == nullptr || layers[0].weightsBatch < 4 ||
         (layers[0].weightsBatch & 1)) {
-        std::fprintf(stderr,
-            "[Fastllm][DBG-cache] early reject: layers=%p layerCount=%d "
-            "weights0=%p weightsBatch0=%d\n",
-            (const void *)layers, layerCount,
-            layers ? (const void *)layers[0].weights : nullptr,
-            layers && layers[0].weights ? layers[0].weightsBatch : -1);
         return false;
     }
     const int experts = layers[0].weightsBatch / 2 - 1;
     if (experts <= 0) {
-        std::fprintf(stderr, "[Fastllm][DBG-cache] experts<=0: %d\n", experts);
         return false;
     }
 
@@ -2050,14 +2034,6 @@ bool FastllmCudaPrepareMoeCache(
     if (registerBeforeSnapshot) {
         registerNumaWeights();
     }
-    std::fprintf(stderr,
-        "[Fastllm][DBG-bc] start glm5=%d v41=%d regNuma=%d canonicalGlmGGUF=%d "
-        "regBeforeSnapshot=%d layerCount=%d experts=%d firstDtype=%d\n",
-        (int)layers[0].glm5, (int)layers[0].deepSeekV41,
-        (int)(registerNumaWeights != nullptr), (int)canonicalGlmGGUF,
-        (int)registerBeforeSnapshot, layerCount, experts,
-        layers[0].weights && layers[0].weights[2]
-            ? (int)layers[0].weights[2]->dataType : -1);
     OffloadLayout layout;
     layout.experts = experts;
     std::vector<OffloadLayout> layerLayouts;
@@ -2069,14 +2045,6 @@ bool FastllmCudaPrepareMoeCache(
             layers[layer].deepSeekV41 != layers[0].deepSeekV41 ||
             layers[layer].glm5 != layers[0].glm5 ||
             layers[layer].swigluLimit != layers[0].swigluLimit) {
-            std::fprintf(stderr,
-                "[Fastllm][DBG-cache] layer %d mismatch: weights=%p batch=%d "
-                "expect=%d v41=%d glm5=%d swiglu=%d (ref v41=%d glm5=%d swiglu=%d)\n",
-                layer, (const void *)layers[layer].weights,
-                layers[layer].weightsBatch, (experts + 1) * 2,
-                layers[layer].deepSeekV41, layers[layer].glm5,
-                layers[layer].swigluLimit,
-                layers[0].deepSeekV41, layers[0].glm5, layers[0].swigluLimit);
             return false;
         }
         OffloadLayout layerLayout;
@@ -2129,30 +2097,13 @@ bool FastllmCudaPrepareMoeCache(
                 layout.recordStride = std::max(layout.recordStride, observed.recordStride);
             } else {
                 OffloadLayout checked;
-                if (!(v41GGUF ? ValidateV41GGUFPair : ValidateWeightPair)(layers[layer].weights[position],
-                                        layers[layer].weights[position + 1], &layout, checked)) {
-                    std::fprintf(stderr,
-                        "[Fastllm][DBG-xlayer] cross-layer reject layer %d expert %d: "
-                        "ref[wt=%d hid=%d inter=%d gB=%zu dB=%zu stride=%zu gBK=%d gBM=%d dBK=%d dBM=%d] "
-                        "obs[wt=%d hid=%d inter=%d gB=%zu dB=%zu stride=%zu gBK=%d gBM=%d dBK=%d dBM=%d]\n",
-                        layer, expert,
-                        (int)layout.weightType, layout.hidden, layout.inter,
-                        layout.gateBytes, layout.downBytes, layout.recordStride,
-                        layout.gateBlockK, layout.gateBlockM, layout.downBlockK, layout.downBlockM,
-                        (int)checked.weightType, checked.hidden, checked.inter,
-                        checked.gateBytes, checked.downBytes, checked.recordStride,
-                        checked.gateBlockK, checked.gateBlockM, checked.downBlockK, checked.downBlockM);
-                    return false;
-                }
+                if (!(v41GGUF ? ValidateV41GGUFPair : ValidateWeightPair)(
+                        layers[layer].weights[position], layers[layer].weights[position + 1],
+                        &layout, checked)) return false;
             }
         }
         layerLayouts.push_back(layerLayout);
     }
-    std::fprintf(stderr,
-        "[Fastllm][DBG-bc] expert loop done layerCount=%d experts=%d "
-        "layout[wt=%d hid=%d inter=%d stride=%zu]\n",
-        layerCount, experts, (int)layout.weightType, layout.hidden,
-        layout.inter, layout.recordStride);
 
     std::unique_ptr<OffloadGroup> group(new OffloadGroup());
     group->layout = layout;
@@ -2165,12 +2116,10 @@ bool FastllmCudaPrepareMoeCache(
     if (static_cast<size_t>(layerCount) >
             static_cast<size_t>(INT_MAX) /
                 static_cast<size_t>(experts)) {
-        std::fprintf(stderr, "[Fastllm][DBG-bc] overflow-1 reject\n");
         return false;
     }
     group->totalRecords = static_cast<size_t>(layerCount) * experts;
     if (group->totalRecords > SIZE_MAX / layout.recordStride) {
-        std::fprintf(stderr, "[Fastllm][DBG-bc] overflow-2 reject\n");
         return false;
     }
     const size_t requestedSlots = RequestedSlots(
@@ -2197,22 +2146,8 @@ bool FastllmCudaPrepareMoeCache(
         layout.weightType == fastllm::DATA_GGUF_FORMAT && !layout.deepSeekV41 &&
         CanShareGGUFWeights(layers, layerCount);
     if (shareNuma && (!storage || layout.recordStride > UINT32_MAX / kMaxTopK ||
-                      !storage->plan(layout, group->sharedLayout))) {
-        std::fprintf(stderr,
-            "[Fastllm][DBG-plan] shareNuma reject: storage=%p recordStride=%zu "
-            "weightType=%d gBlockK=%d gBlockM=%d dBlockK=%d dBlockM=%d "
-            "hidden=%d inter=%d\n",
-            (const void *)storage, layout.recordStride,
-            (int)layout.weightType, layout.gateBlockK, layout.gateBlockM,
-            layout.downBlockK, layout.downBlockM, layout.hidden, layout.inter);
-        return false;
-    }
+                      !storage->plan(layout, group->sharedLayout))) return false;
     const size_t hostStride = shareNuma ? group->sharedLayout.auxiliaryBytes : layout.recordStride;
-    std::fprintf(stderr,
-        "[Fastllm][DBG-bc] passed plan requestedSlots=%zu backend=%p storage=%p "
-        "shareNuma=%d shareGGUF=%d hostStride=%zu\n",
-        requestedSlots, (const void *)backend, (const void *)storage,
-        (int)shareNuma, (int)shareGGUF, hostStride);
     size_t hostBytes = 0;
     for (int layer = 0; layer < layerCount; ++layer) {
         group->layerHostOffsets.push_back(hostBytes);
@@ -2239,10 +2174,6 @@ bool FastllmCudaPrepareMoeCache(
             // device pointer when several GPU contexts are live. Under unified
             // virtual addressing the host address is already a valid device
             // address, so fall back to it instead of dropping the cache.
-            std::fprintf(stderr,
-                "[Fastllm][DBG-map] cudaHostGetDevicePointer failed (%s); "
-                "falling back to the UVA host address.\n",
-                cudaGetErrorString(mapState));
             cudaGetLastError();
             mapped = host;
         }
@@ -3160,12 +3091,6 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
     using namespace fastllm;
     const int count = state.ranks.size();
     AssertInFastLLM(rank >= 0 && rank < count, "Invalid MoE EP rank.\n");
-    { static bool epEntryPrinted = false;
-      if (!epEntryPrinted && rank != 0) { epEntryPrinted = true;
-        int dbgDevice = -1; cudaGetDevice(&dbgDevice);
-        std::fprintf(stderr, "[Fastllm][EP-DBG] rank1 entered: input dev=%d cudaData=%p dtype=%d dims=[%ld,%ld]\n",
-            dbgDevice, (void*)input.cudaData, (int)input.dataType,
-            (long)(input.dims.empty()?-1:input.dims[0]), (long)(input.dims.size()<2?-1:input.dims[1])); } }
     auto &work = *state.ranks[rank];
     auto &root = *state.ranks[0];
     constexpr int maxRoutes = FastllmCudaMoeExpertParallel::maxRoutes;
@@ -3176,12 +3101,6 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
         cudaStreamIsCapturing(cudaStreamPerThread, &capture) == cudaSuccess &&
         capture == cudaStreamCaptureStatusNone;
     work.group = work.ready ? FindHybridGroup(weights, weightsBatch, &work.table) : nullptr;
-    { static bool epC3Printed = false;
-      if (!epC3Printed && rank != 0 && work.group) { epC3Printed = true;
-        const auto &ll = work.group->LayerLayout(work.table);
-        std::fprintf(stderr, "[Fastllm][EP-DBG] rank1 c3: step1Ready=%d v41=%d glm5=%d inDim1=%d llHidden=%d table=%d cudaDevice=%d device=%d\n",
-            (int)work.ready, (int)work.group->layout.deepSeekV41, (int)work.group->layout.glm5,
-            input.dims.empty() ? -1 : input.dims[1], ll.hidden, work.table, work.cudaDevice, device); } }
     // Packed-NVFP4 ("glm5 family") groups share the hybrid record assembly
     // and CPU-miss path; EP rank splitting is record-format agnostic.
     const bool glmBatch = work.group && work.group->layout.glm5;
@@ -3259,11 +3178,6 @@ bool FastllmCudaMergeMOEExpertParallel(FastllmCudaMoeExpertParallel &state, int 
         // Rank 0 already drains this stream with the input/route readback.
         checkCudaErrors("EP host residency", cudaStreamSynchronize(cudaStreamPerThread));
     }
-    { static bool epReadyPrinted = false;
-      if (!epReadyPrinted && rank != 0) { epReadyPrinted = true;
-        std::fprintf(stderr, "[Fastllm][EP-DBG] rank1 pre-barrier: ready=%d cache=%p group=%p table=%d hidden=%d rows=%d cudaDevice=%d reqCache=%d supportedInput=%d\n",
-            (int)work.ready, (void*)work.cache, (void*)work.group, work.table, work.hidden, work.rows,
-            work.cudaDevice, (int)FastllmCudaMoeCacheRequested(), (int)SupportedCacheInput(input)); } }
     state.Barrier();
     bool ready = root.ready, anyCache = false;
     for (int r = 0; r < count; ++r) {

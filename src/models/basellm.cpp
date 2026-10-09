@@ -688,7 +688,6 @@ namespace fastllm {
             reusablePrefixLen = 0;
         }
 
-        int recordedChains = 0;
         std::function<void(Data&)> recordPagedCache = [&](Data &cache) {
             if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
                 bool recordedLocal = false;
@@ -705,7 +704,6 @@ namespace fastllm {
             if (cache.pagedKVCacheData != nullptr && !cache.pageIndex.empty() &&
                 cache.pagedKVCacheData->type == PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
                 cache.pagedKVCacheData->Record(this->allTokens, cache.pageIndex);
-                recordedChains++;
             }
         };
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -719,14 +717,6 @@ namespace fastllm {
             }
             recordPagedCache(kvFirst);
             recordPagedCache(kvSecond);
-        }
-        if (getenv("FASTLLM_PREFIX_CACHE_DEBUG") != nullptr &&
-            !this->multimodalInput.empty()) {
-            fprintf(stderr, "[PCDBG-B] record mm=1 allTokens=%d reusablePrefix=%d "
-                            "chains=%d extra=%d\n",
-                    (int)this->allTokens.size(), reusablePrefixLen,
-                    recordedChains, (int)recordedPrefixExtra);
-            fflush(stderr);
         }
     }
 
@@ -1949,15 +1939,6 @@ namespace fastllm {
                             (!isMultimodal || mediaKeyedPrefixCache) && ctx->cacheLen == 0 &&
                             ctx->intParams.find("paged_prefix_restore_disabled") ==
                                 ctx->intParams.end();
-                        if (getenv("FASTLLM_PREFIX_CACHE_DEBUG") != nullptr) {
-                            fprintf(stderr, "[PCDBG-B] sched prompt=%d mm=%d cacheLen=%d cur=%d "
-                                            "kvMem=%d mediaKeyed=%d probeAllowed=%d\n",
-                                    (int)isPrompt, (int)isMultimodal, ctx->cacheLen,
-                                    (int)ctx->currentTokens.size(),
-                                    (int)model->kvMemConfig.enabled,
-                                    (int)mediaKeyedPrefixCache, (int)probeAllowed);
-                            fflush(stderr);
-                        }
                         if (probeAllowed) {
                             PagedCacheManager *probeManager = nullptr;
                             bool queryUnboundedLayersOnly = false;
@@ -1997,13 +1978,6 @@ namespace fastllm {
                                 };
 
                                 int minCachedPages = (int)queryManager(probeManager).size();
-                                if (getenv("FASTLLM_PREFIX_CACHE_DEBUG") != nullptr) {
-                                    fprintf(stderr, "[PCDBG-B] probe manager=%p mm=%d cur=%d "
-                                                    "minCachedPages=%d\n",
-                                            (void*)probeManager, (int)isMultimodal,
-                                            (int)ctx->currentTokens.size(), minCachedPages);
-                                    fflush(stderr);
-                                }
                                 if (minCachedPages > 0) {
                                     for (int li = 0; li < model->block_cnt; li++) {
                                         if (queryUnboundedLayersOnly &&

@@ -4939,24 +4939,6 @@ namespace fastllm {
             return snapshot != nullptr && snapshot->mediaKeys == mediaKeys;
         }
 
-        // 前缀缓存调试开关 (FASTLLM_PREFIX_CACHE_DEBUG=1): 输出到 stderr 避免块缓冲.
-        static bool Qwen35PrefixCacheDebugEnabled() {
-            static const bool enabled = std::getenv("FASTLLM_PREFIX_CACHE_DEBUG") != nullptr;
-            return enabled;
-        }
-
-        static bool Qwen35PrefixCacheDebugBudget() {
-            static std::atomic<int> budget(400);
-            return budget.fetch_sub(1) > 0;
-        }
-
-#define QWEN35_PC_DEBUG(...)                                                        \
-        do {                                                                        \
-            if (Qwen35PrefixCacheDebugEnabled() && Qwen35PrefixCacheDebugBudget()) { \
-                fprintf(stderr, "[PCDBG] " __VA_ARGS__);                            \
-            }                                                                       \
-        } while (0)
-
         static int Qwen35EnvInt(const char *name, int fallback) {
             const char *value = std::getenv(name);
             if (value == nullptr || value[0] == 0) {
@@ -5399,25 +5381,8 @@ namespace fastllm {
                 return nullptr;
             }
             const Qwen35LinearPrefixSnapshot *best = nullptr;
-            QWEN35_PC_DEBUG("look: reqTokens=%zu maxLen=%d exact=%d requireMtp=%d reqMedia=%zu cands=%zu\n",
-                            tokens.size(), maxCachedLen, exactLen, (int)requireMtp,
-                            mediaKeys != nullptr ? mediaKeys->size() : (size_t)-1,
-                            it->second.size());
             for (auto &snapshotPtr : it->second) {
                 Qwen35LinearPrefixSnapshot *snapshot = snapshotPtr.get();
-                if (snapshot != nullptr) {
-                    bool tokRange = snapshot->cachedLen > 0 &&
-                                    snapshot->cachedLen <= maxCachedLen &&
-                                    snapshot->cachedLen <= (int)tokens.size() &&
-                                    (exactLen < 0 || snapshot->cachedLen == exactLen);
-                    bool tokEq = tokRange && (int)snapshot->tokens.size() == snapshot->cachedLen &&
-                                 std::equal(snapshot->tokens.begin(), snapshot->tokens.end(), tokens.begin());
-                    bool meEq = mediaKeys == nullptr || snapshot->mediaKeys == *mediaKeys;
-                    QWEN35_PC_DEBUG("look cand len=%d tokEq=%d snapTok=%zu snapMedia=%zu mediaEq=%d mtp=%d mtpTok=%d\n",
-                                    snapshot->cachedLen, (int)tokEq, snapshot->tokens.size(),
-                                    snapshot->mediaKeys.size(), (int)meEq,
-                                    (int)snapshot->mtpValid, snapshot->mtpTokens);
-                }
                 if (snapshot == nullptr || snapshot->cachedLen <= 0 ||
                     snapshot->cachedLen > maxCachedLen ||
                     snapshot->cachedLen > (int)tokens.size()) {
@@ -8327,24 +8292,6 @@ namespace fastllm {
             return snapshot != nullptr && snapshot->mediaKeys == mediaKeys;
         }
 
-        // 前缀缓存调试开关 (FASTLLM_PREFIX_CACHE_DEBUG=1): 输出到 stderr 避免块缓冲.
-        static bool Qwen35PrefixCacheDebugEnabled() {
-            static const bool enabled = std::getenv("FASTLLM_PREFIX_CACHE_DEBUG") != nullptr;
-            return enabled;
-        }
-
-        static bool Qwen35PrefixCacheDebugBudget() {
-            static std::atomic<int> budget(400);
-            return budget.fetch_sub(1) > 0;
-        }
-
-#define QWEN35_PC_DEBUG(...)                                                        \
-        do {                                                                        \
-            if (Qwen35PrefixCacheDebugEnabled() && Qwen35PrefixCacheDebugBudget()) { \
-                fprintf(stderr, "[PCDBG] " __VA_ARGS__);                            \
-            }                                                                       \
-        } while (0)
-
         static bool Qwen35LinearPrefixCacheEnabled() {
             return false;
         }
@@ -10435,18 +10382,12 @@ namespace fastllm {
         if (context == nullptr ||
             !Qwen35LinearPrefixCacheEnabled() ||
             !Qwen35HasLinearAttentionLayers(this, this->block_cnt)) {
-            QWEN35_PC_DEBUG("rec bail top: ctx=%p enabled=%d linear=%d\n",
-                            (void*)context, (int)Qwen35LinearPrefixCacheEnabled(),
-                            (int)(context != nullptr && Qwen35HasLinearAttentionLayers(this, this->block_cnt)));
             return false;
         }
         int pageLen = fastllm::GetPageLen();
         int currentLen = Qwen35CurrentTokenGrowingCacheLen(this, this->block_cnt, context->pastKeyValues);
         if (currentLen <= 0 || currentLen > (int)context->allTokens.size() ||
             currentLen % pageLen != 0) {
-            QWEN35_PC_DEBUG("rec bail len: len=%d all=%zu pageLen=%d mm=%zu\n",
-                            currentLen, context->allTokens.size(), pageLen,
-                            context->multimodalInput.size());
             return false;
         }
         int lastSnapshotLen = context->intParams["qwen35_linear_prefix_last_len"];
@@ -10467,13 +10408,7 @@ namespace fastllm {
         context->intParams["qwen35_force_prefix_snapshot"] = 0;
         if (!forceSnapshot && snapshotCount > 0 &&
             currentLen - lastSnapshotLen < interval) {
-            QWEN35_PC_DEBUG("rec bail interval: len=%d last=%d interval=%d\n",
-                            currentLen, lastSnapshotLen, interval);
             return false;
-        }
-        if (forceSnapshot) {
-            QWEN35_PC_DEBUG("rec force vision boundary: len=%d last=%d\n",
-                            currentLen, lastSnapshotLen);
         }
         int requestId = context->intParams["qwen35_linear_prefix_request_id"];
         if (requestId <= 0) {
@@ -10493,8 +10428,6 @@ namespace fastllm {
         // 保持与旧行为一致的保守处理.
         snapshot->mediaKeys = Qwen35SnapshotMediaKeys(context);
         if (!context->multimodalInput.empty() && snapshot->mediaKeys.empty()) {
-            QWEN35_PC_DEBUG("rec bail keys: len=%d mmInput=%zu keys=0 (拒绝记录)\n",
-                            currentLen, context->multimodalInput.size());
             return false;
         }
         snapshot->layers.resize(this->block_cnt);
@@ -10556,11 +10489,6 @@ namespace fastllm {
                     mtpIt->second.key.dims[1] != currentLen ||
                     mtpIt->second.value.dims[1] != currentLen ||
                     !SnapshotMtpPagedCache(mtpIt->second, snapshot->mtpKey, snapshot->mtpValue)) {
-                    QWEN35_PC_DEBUG("rec bail mtp: len=%d found=%d mtpTokens=%d kdims=%zu vdims=%zu\n",
-                                    currentLen, (int)(mtpIt != mtpCaches.end()),
-                                    mtpIt != mtpCaches.end() ? mtpIt->second.tokens : -1,
-                                    mtpIt != mtpCaches.end() ? mtpIt->second.key.dims.size() : 0,
-                                    mtpIt != mtpCaches.end() ? mtpIt->second.value.dims.size() : 0);
                     return false;
                 }
                 snapshot->mtpValid = true;
@@ -10592,11 +10520,6 @@ namespace fastllm {
             snapshot->requestId = requestId;
             snapshot->timestamp = ++Qwen35LinearPrefixSnapshotTimestamp();
             items.push_back(std::move(snapshot));
-            QWEN35_PC_DEBUG("rec ok: len=%d media=%zu mtpValid=%d total=%zu\n",
-                            items.back() != nullptr ? items.back()->cachedLen : -1,
-                            items.back() != nullptr ? items.back()->mediaKeys.size() : 0,
-                            items.back() != nullptr ? (int)items.back()->mtpValid : -1,
-                            items.size());
             int maxPerRequest = Qwen35LinearPrefixSnapshotMaxPerRequest();
             int requestRecords = 0;
             for (auto &item : items) {
@@ -29431,17 +29354,6 @@ namespace fastllm {
         return value;
     }
 
-    // 诊断/探针总开关。启动脚本会把 FASTLLM_DFLASH_PROBE=0 显式传进来，
-    // 因此这里把 "0"/"false"/"off" 也当关闭，而不是只看 getenv 是否为 null。
-    static bool Qwen35DFlashDiagEnabled() {
-        static const bool enabled = []() {
-            const char *env = std::getenv("FASTLLM_DFLASH_PROBE");
-            return env != nullptr && env[0] != '\0' &&
-                   std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 &&
-                   std::strcmp(env, "FALSE") != 0 && std::strcmp(env, "off") != 0;
-        }();
-        return enabled;
-    }
 #endif
 
     // Quantized draft projections keep their original BF16 activation boundary.
@@ -29496,14 +29408,6 @@ namespace fastllm {
             }
         }
         Linear(*source, linearWeight, bias, output);
-        if (Qwen35DFlashDiagEnabled()) {
-            printf("[RunDFlashLinear] inType=%d scaled=%d scratch=%d rows=%d m=%d\n",
-                   (int)input.dataType, (int)scaled,
-                   (int)(halfInputScratch != nullptr),
-                   input.dims.empty() ? -1 : (int)(input.Count(0) / input.dims.back()),
-                   input.dims.empty() ? -1 : (int)input.dims.back());
-            fflush(stdout);
-        }
         bool scaledBack = false;
 #ifdef USE_CUDA
         scaledBack = scaled && FastllmCudaDFlashScaleBack(output, input);
@@ -30380,16 +30284,6 @@ namespace fastllm {
             // 只有 BF16 的指数范围放得下；调用方随后会转成 FP32 再送 top-k。
             FastllmCudaDFlashScaleBack(output, input);
         }
-        if (Qwen35DFlashDiagEnabled()) {
-            printf("[DFlashLmHead] dev=%d scaled=%d headType=%d inType=%d "
-                   "outType=%d inDims=%d rows=%d vocab=%d\n",
-                   device, (int)scaled, (int)head->dataType, (int)input.dataType,
-                   (int)output.dataType,
-                   input.dims.empty() ? -1 : (int)input.dims.back(),
-                   output.dims.empty() ? -1 : (int)output.dims[0],
-                   output.dims.empty() ? -1 : (int)output.dims.back());
-            fflush(stdout);
-        }
 #else
         (void)device;
         (void)useShortlist;
@@ -30559,132 +30453,6 @@ namespace fastllm {
 #endif
     }
 
-
-#ifdef USE_CUDA
-        // ── DFlash2 数值探针 ──────────────────────────────────────────────
-        // 只读：物化一份 FP32 拷贝到 host 统计 absmax 与超阈计数，不改动被探张量。
-        // 默认关闭；FASTLLM_DFLASH_PROBE=1 打开。CUDA Graph 捕获期自动跳过。
-        static bool Qwen35DFlashProbeEnabled() {
-            return Qwen35DFlashDiagEnabled();
-        }
-
-        static void Qwen35DFlashProbe(const char *tag, int layer, const Data &src) {
-            if (!Qwen35DFlashProbeEnabled() || src.dims.empty()) return;
-            if (FastllmCudaGraphIsCapturing()) return;
-            if (src.dataDevice != DataDevice::CUDA || src.cudaData == nullptr) return;
-            const long long count = src.Count(0);
-            if (count <= 0) return;
-            Data f32;
-            std::vector<float> host;
-            const float *v = nullptr;
-            try {
-                ToDataType(src, f32, DataType::FLOAT32);
-                if (f32.dataDevice == DataDevice::CUDA && f32.cudaData != nullptr) {
-                    host.resize((size_t) count);
-                    FastllmCudaCopyFromDeviceToHost(
-                        host.data(), f32.cudaData, (size_t) count * sizeof(float));
-                    v = host.data();
-                } else if (f32.cpuData != nullptr) {
-                    v = (const float *) f32.cpuData;
-                }
-            } catch (...) {
-                printf("[DFlash探针] L%d %-26s <读取异常>\n", layer, tag);
-                fflush(stdout);
-                return;
-            }
-            if (v == nullptr) return;
-            double amax = 0.0, sum = 0.0, sumsq = 0.0;
-            long long o65504 = 0, o1e5 = 0, o1e6 = 0, o1e7 = 0, nonfinite = 0;
-            std::vector<float> absValues;
-            absValues.reserve((size_t) count);
-            for (long long i = 0; i < count; i++) {
-                const float x = v[i];
-                if (!std::isfinite(x)) { nonfinite++; continue; }
-                const double a = std::fabs((double) x);
-                sum += x;
-                sumsq += (double) x * (double) x;
-                absValues.push_back((float) a);
-                if (a > amax) amax = a;
-                if (a > 65504.0)  o65504++;
-                if (a > 1.0e5)    o1e5++;
-                if (a > 1.0e6)    o1e6++;
-                if (a > 1.0e7)    o1e7++;
-            }
-            // 均值/标准差/分位数：用来判断激活是不是被"直流分量"主导 ——
-            // 若 |mean| 与 std 同量级、q50 接近 amax，则 GEMM 会顶到
-            // Σ|W_row|·max|x| 的上界（实测 o_proj/gateup 都越界），
-            // 正常激活应该是 q50 ≪ amax 的重尾分布。
-            const double finite = (double) std::max<long long>(1, count - nonfinite);
-            const double mean = sum / finite;
-            const double var = std::max(0.0, sumsq / finite - mean * mean);
-            const double sd = std::sqrt(var);
-            double q50 = 0.0, q99 = 0.0;
-            if (!absValues.empty()) {
-                const size_t k50 = (size_t) (absValues.size() * 0.50);
-                const size_t k99 = std::min(absValues.size() - 1,
-                                            (size_t) (absValues.size() * 0.99));
-                std::nth_element(absValues.begin(), absValues.begin() + k50, absValues.end());
-                q50 = absValues[k50];
-                std::nth_element(absValues.begin(), absValues.begin() + k99, absValues.end());
-                q99 = absValues[k99];
-            }
-            printf("[DFlash探针] L%d %-26s n=%-7lld amax=%-11.5g mean=%-11.5g std=%-11.5g q50=%-11.5g q99=%-11.5g |mean|/std=%-8.3g amax/std=%-8.4g >65504=%-6lld >1e5=%-6lld >1e6=%-6lld >1e7=%-5lld 非有限=%lld\n",
-                   layer, tag, count, amax, mean, sd, q50, q99,
-                   sd > 0.0 ? std::fabs(mean) / sd : 0.0,
-                   sd > 0.0 ? amax / sd : 0.0,
-                   o65504, o1e5, o1e6, o1e7, nonfinite);
-            fflush(stdout);
-
-            // 结构分析：极端值到底集中在少数"列"（输出通道 -> 权重行的锅），
-            // 还是集中在少数"行"（token -> 激活离群点的锅）。
-            if (std::getenv("FASTLLM_DFLASH_PROBE_STRUCT") != nullptr &&
-                (std::strstr(tag, "o_proj") != nullptr ||
-                 std::strstr(tag, "conv_res") != nullptr ||
-                 std::strstr(tag, "after_attn") != nullptr)) {
-                const int cols = src.dims.back() > 0 ? src.dims.back() : 1;
-                const long long rows = count / cols;
-                if (rows > 0 && cols > 0 && (long long) cols * rows == count) {
-                    std::vector<double> colMax((size_t) cols, 0.0);
-                    std::vector<char> rowBad((size_t) rows, 0);
-                    long long badCols = 0, badRows = 0, badVals = 0;
-                    double topA[8];
-                    long long topI[8];
-                    for (int k = 0; k < 8; k++) { topA[k] = -1.0; topI[k] = -1; }
-                    for (long long i = 0; i < count; i++) {
-                        const float x = v[i];
-                        if (!std::isfinite(x)) continue;
-                        const double a = std::fabs((double) x);
-                        const long long c = i % cols;
-                        if (a > colMax[(size_t) c]) colMax[(size_t) c] = a;
-                        if (a > 65504.0) {
-                            badVals++;
-                            const long long r = i / cols;
-                            if (!rowBad[(size_t) r]) { rowBad[(size_t) r] = 1; badRows++; }
-                        }
-                        if (a > topA[7]) {
-                            topA[7] = a; topI[7] = i;
-                            for (int k = 7; k > 0 && topA[k] > topA[k - 1]; k--) {
-                                double ta = topA[k]; topA[k] = topA[k - 1]; topA[k - 1] = ta;
-                                long long ti = topI[k]; topI[k] = topI[k - 1]; topI[k - 1] = ti;
-                            }
-                        }
-                    }
-                    for (int c = 0; c < cols; c++) {
-                        if (colMax[(size_t) c] > 65504.0) badCols++;
-                    }
-                    printf("[DFlash结构] L%d %-24s 越界值=%-5lld 涉及行=%lld/%lld 涉及列=%lld/%d\n",
-                           layer, tag, badVals, badRows, rows, badCols, cols);
-                    printf("[DFlash结构]       top8 (行,列)=值:");
-                    for (int k = 0; k < 8 && topI[k] >= 0; k++) {
-                        printf(" (%lld,%lld)=%.4g", topI[k] / cols, topI[k] % cols, topA[k]);
-                    }
-                    printf("\n");
-                    fflush(stdout);
-                }
-            }
-        }
-#endif
-
     void Qwen3_5Model::AppendDFlashTargetHidden(
             int device, int tokens, DFlashContext &context) {
 #ifndef USE_CUDA
@@ -30768,7 +30536,6 @@ namespace fastllm {
                     captured.unitSizeDiv == 1 &&
                     captured.unitSize == (int)elementBytes,
                 "DFlash selected target hidden layout is invalid.\n");
-            Qwen35DFlashProbe("KV.target_hidden", feature, captured);
             if (batchCopies) {
                 for (int row = 0; row < tokens; ++row) {
                     copyDsts.push_back(static_cast<uint8_t*>(combined.cudaData) +
@@ -30794,7 +30561,6 @@ namespace fastllm {
             }
         }
         Data projected, projectedContextHidden;
-        Qwen35DFlashProbe("KV.combined_in", -1, combined);
         // TP 下 fc 按输出维行并行，各卡算 [tokens, 2560] 再由 gather 收成
         // [tokens, 5120]。分片路径要求输出先分配好（executor 不会替空输出
         // 分配，会拿它去 ToDevice）。
@@ -30807,13 +30573,11 @@ namespace fastllm {
         // 行并行 + output gather（fc 无 bias，传空偏置）。
         RunDFlashTpLinear(device, combined, projectionWeight,
                *GetEmptyData(), projected, true);
-        Qwen35DFlashProbe("KV.fc_out", -1, projected);
         if (projected.dataType != DataType::BFLOAT16) {
             ToDataType(projected, DataType::BFLOAT16);
         }
         RMSNorm(projected, weight["dflash.hidden_norm.weight"],
                 dflashRmsNormEps, projectedContextHidden);
-        Qwen35DFlashProbe("KV.hidden_norm_out", -1, projectedContextHidden);
 
         const int startPosition = context.committedTokens;
         AssertInFastLLM(startPosition >= 0 && tokens <= max_positions - startPosition,
@@ -30843,7 +30607,6 @@ namespace fastllm {
                 "DFlash fused KV projection weight shape is invalid.\n");
             RunDFlashLinear(projectedContextHidden, allKvWeightIt->second,
                    *GetEmptyData(), projectedAllKv);
-            Qwen35DFlashProbe("KV.all_kv_out", -1, projectedAllKv);
         }
         auto allKNormIt = weight.weight.find("dflash.all_k_norm.weight");
         const bool canFuseKvMaterialization =
@@ -31216,15 +30979,6 @@ namespace fastllm {
         int previousToken = anchorToken;
         std::vector<float> predecessorHidden(dflashSelectorRank);
         std::vector<float> scoreProducts(dflashSelectorRank);
-        if (Qwen35DFlashDiagEnabled()) {
-            printf("[DFlash selector] topK raw:");
-            for (int i = 0; i < 8 && i < dflashSelectorTopK; ++i) {
-                printf(" (%.6g,%.6g)", candidateTopK[i * 2],
-                       candidateTopK[i * 2 + 1]);
-            }
-            printf("\n");
-            fflush(stdout);
-        }
         for (int position = 0; position < slots; ++position) {
             AssertInFastLLM(
                 previousToken >= 0 && previousToken < predecessor.dims[0],
@@ -31242,14 +30996,6 @@ namespace fastllm {
                     ((size_t)position * dflashSelectorTopK + candidate) * 2;
                 const int candidateToken =
                     (int)(candidateTopK[topKOffset] + 1.0e-3f);
-                if (candidateToken < 0 || candidateToken >= successor.dims[0]) {
-                    printf("[DFlash selector] 越界候选 pos=%d cand=%d id=%d raw=%.6g "
-                           "vocab=%d topK=%d\n",
-                           position, candidate, candidateToken,
-                           candidateTopK[topKOffset], successor.dims[0],
-                           dflashSelectorTopK);
-                    fflush(stdout);
-                }
                 AssertInFastLLM(
                     candidateToken >= 0 && candidateToken < successor.dims[0],
                     "DFlash selector candidate id is out of range.\n");
@@ -31337,7 +31083,6 @@ namespace fastllm {
             localRows > 0 && firstRow >= 0 && outputRows > 0 &&
                 firstRow + outputRows <= localRows && topK > 0,
             "DFlash CUDA top-k got an invalid row range.\n");
-        Qwen35DFlashProbe("selector.logits", -1, logits);
 
         Data packedCandidates, scratch;
         Qwen3CudaPrepareLocalOutput(packedCandidates, device);
@@ -31631,7 +31376,6 @@ namespace fastllm {
         } else if (hiddenStates.dataType != DataType::BFLOAT16) {
             ToDataType(hiddenStates, DataType::BFLOAT16);
         }
-        Qwen35DFlashProbe("res.entry", -1, hiddenStates);
         // ── 残差改为 FP32 累加（参考实现 vllm_dflash2 的同款修法）──────────
         // 这个草稿的残差涨到 ~6e11：BF16 在 7e10 处的 ulp≈2.8e8，而每层注意力
         // 的贡献只有 1e6~1e7，BF16 累加会把它们整段舍掉。实测 L1/L2/L3 的
@@ -31752,13 +31496,10 @@ namespace fastllm {
                        weight[prefix +
                               "attention_conv.kernel_projection.weight"],
                        *GetEmptyData(), attentionDynamic, compute ? &buffers.halfAttentionDynamic : nullptr);
-                Qwen35DFlashProbe("attn.in_norm", layerIndex, normalized);
-                Qwen35DFlashProbe("attn.conv_proj", layerIndex, attentionDynamic);
                 dynamicConvolve(
                     normalized, attentionDynamic,
                     weight[prefix + "attention_conv.base_kernel"], 0,
                     attentionInput);
-                Qwen35DFlashProbe("attn.conv_out", layerIndex, attentionInput);
 
                 bool fusedQkvPrepared = false;
                 auto mergedQkvIt = weight.weight.find(
@@ -31768,7 +31509,6 @@ namespace fastllm {
                     const int kvChannels = dflashKvHeads * dflashHeadDim;
                     RunDFlashLinear(attentionInput, mergedQkvIt->second,
                            *GetEmptyData(), mergedQkv, compute ? &buffers.halfQkv : nullptr);
-                    Qwen35DFlashProbe("attn.mergeqkv", layerIndex, mergedQkv);
                     for (auto item : {
                              std::make_pair(&query, dflashHeads),
                              std::make_pair(&key, dflashKvHeads),
@@ -31953,9 +31693,6 @@ namespace fastllm {
                     weight[prefix + "attention_conv.base_kernel"], 1, buffers.convolvedAttention);
                 ToDataType(buffers.convolvedAttention, convWide, DataType::FLOAT32);
                 AddTo(hiddenStates, convWide);
-                Qwen35DFlashProbe("attn.o_proj", layerIndex, attentionOutput);
-                Qwen35DFlashProbe("attn.conv_res", layerIndex, buffers.convolvedAttention);
-                Qwen35DFlashProbe("res.after_attn", layerIndex, hiddenStates);
 
                 RMSNorm(hiddenStates,
                         weight[prefix + "post_attention_layernorm.weight"],
@@ -31964,13 +31701,10 @@ namespace fastllm {
                 RunDFlashLinear(normalized,
                        weight[prefix + "mlp_conv.kernel_projection.weight"],
                        *GetEmptyData(), mlpDynamic, compute ? &buffers.halfMlpDynamic : nullptr);
-                Qwen35DFlashProbe("mlp.in_norm", layerIndex, normalized);
-                Qwen35DFlashProbe("mlp.conv_proj", layerIndex, mlpDynamic);
                 dynamicConvolve(
                     normalized, mlpDynamic,
                     weight[prefix + "mlp_conv.base_kernel"], 0,
                     mlpInput);
-                Qwen35DFlashProbe("mlp.conv_out", layerIndex, mlpInput);
             };
             auto runMlp = [&]() {
                 auto gateupIt = weight.weight.find(
@@ -32028,7 +31762,6 @@ namespace fastllm {
                             weight[prefix + "mlp.up_proj.weight"],
                             *GetEmptyData(), up);
                     }
-                    Qwen35DFlashProbe("mlp.gateup", layerIndex, gateup);
                     if (!fusedGateupPrepared) {
                         computeCompatible = false;
                         // silu 和乘都在 BF16 里做：gate/up 各自 O(1e3) 没问题，
@@ -32038,10 +31771,8 @@ namespace fastllm {
                         Silu(gate, gate);
                         MulTo(gate, up);
                     }
-                    Qwen35DFlashProbe("mlp.silu_out", layerIndex, gate);
                     RunDFlashLinear(gate, weight[prefix + "mlp.down_proj.weight"],
                            *GetEmptyData(), mlpOutput, compute ? &buffers.halfDown : nullptr);
-                    Qwen35DFlashProbe("mlp.down_proj", layerIndex, mlpOutput);
                 }
             };
             auto runMlpTail = [&]() {
@@ -32049,8 +31780,6 @@ namespace fastllm {
                     weight[prefix + "mlp_conv.base_kernel"], 1, buffers.convolvedMlp);
                 ToDataType(buffers.convolvedMlp, convWide, DataType::FLOAT32);
                 AddTo(hiddenStates, convWide);
-                Qwen35DFlashProbe("mlp.conv_res", layerIndex, buffers.convolvedMlp);
-                Qwen35DFlashProbe("res.after_mlp", layerIndex, hiddenStates);
             };
             if (compute && compute->tpBackbone) {
                 buffers.tail.Run(runTail, useComputeGraphs);
@@ -32081,10 +31810,8 @@ namespace fastllm {
             compute->logged = true;
         }
 
-        Qwen35DFlashProbe("res.final_raw", dflashLayers, hiddenStates);
         RMSNorm(hiddenStates, weight["dflash.norm.weight"],
                 dflashRmsNormEps, hiddenStates);
-        Qwen35DFlashProbe("res.final_norm", dflashLayers, hiddenStates);
         Data slotHidden;
         Split(hiddenStates, 1, 1, runtimeBlockSize, slotHidden);
 
@@ -32219,7 +31946,6 @@ namespace fastllm {
                                   *biasIt->second, localLogits, useShortlist);
                     qwen3cuda::Qwen3CudaToDataType(
                         runner, localLogits, DataType::FLOAT32);
-                    Qwen35DFlashProbe("lmHead.fast", rank, localLogits);
                     ::fastllm::Qwen3CudaPrepareLocalOutput(
                         localPacked[rank], localDevice);
                     localPacked[rank].dataType = DataType::INT32;
@@ -32343,7 +32069,6 @@ namespace fastllm {
                                   *biasIt->second, localLogits, useShortlist);
                 qwen3cuda::Qwen3CudaToDataType(
                     runner, localLogits, DataType::FLOAT32);
-                Qwen35DFlashProbe("lmHead.slow", rank, localLogits);
                 qwen3cuda::Qwen3CudaTopK(
                     runner, localLogits, localTopKs[rank],
                     dflashSelectorTopK);
