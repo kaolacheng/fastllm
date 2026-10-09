@@ -22,7 +22,7 @@
 | 卡间互联 | PHB（经 CPU PCIe root complex），Gen3 x8，无 NVLink |
 | 可用显存 | 驱动另占约 454 MiB，单进程上限约 15930 MiB/卡 |
 | 本例布局 | `cuda2/3` 跑生产实例，`cuda0/1` 可跑参数扫描 |
-| 目标模型 | Qwen3.8-27B-Coder390-W4A4（NVFP4 / W4A4），hidden 5120，24 Q 头 / 4 KV 头，head_dim 256，vocab 248320 |
+| 目标模型 | 生产默认 `workspace/models/merkyor-w4a16/NVFP4/W4A16`（W4A16）；前作 `Qwen3.8-27B-Coder390-W4A4`（NVFP4 / W4A4）。hidden 5120，24 Q 头 / 4 KV 头，head_dim 256，vocab 248320 |
 | 草稿模型 | 同目录 `DFlash2-FP8`，日志报告 `layers=5` |
 | 服务名 / 端口 | `Qwen3.8 27b` / 8092 |
 | 并行与量化 | TP2，FP8 KV Cache，页长 16，chunked prefill 2048 |
@@ -54,6 +54,8 @@ bash scripts/qwen27b/stop_dflash2.sh      # 只按 --port 8092 精确匹配，�
 | `FASTLLM_KV_FINAL_SAFETY_MB` | 8 | 同上 |
 
 启动后就绪判据是日志中的四行：`[Qwen3.5 DFlash2] enabled: layers=5, drafts_per_step=7, ...`、`[Vision] Multimodal workspace ready: ...`、`KV Cache Token limit: 313872 tokens (pageLen=16).`、以及每卡的 `freeAfterWarmup=... targetFree=...`。
+
+> 生产现已切到 mky W4A16，同一配置下 KV 池为 **301136** token，就绪行里的数字随之变化；两种模型的采样默认值逐字相同（都取自模型目录的 `generation_config.json`）。切模型的复测数据、prefill 实测拟合与 INT8 证伪见[实测篇附录](docs/benchmarks/qwen38_27b_dflash2_t10_tp2.md)。
 
 ## KV 池预算与 targetFree 判据
 
@@ -180,6 +182,8 @@ FastLLM fatal CUDA allocation error: Error: cuda malloc failed in Data::MallocSp
 - **`--enable_thinking true` 会吃掉整个输出预算**。`max_tokens` 偏小时返回 HTTP 200 但 `content` 为空（内容全在思考里），容易误判成服务故障。
 - **视觉与 batch 4 在 2 × T10 上不可行**，需降到 batch 2；开视觉后必须重新确认 `KV Cache Token limit` 仍不小于 `max_context_length`。
 - **残留实例会互相干扰**：同卡上并存两个实例时，显存校准会互相抢显存并污染 `targetFree`，参数扫描务必确认卡已释放。
+- **客户端断开不会中止正在跑的 prefill**。日志出现 `is_disconnected!!!` / `Abort request` 后仍有 `[Decode] pending=1`，长请求会继续算完并占着引擎（实测一个 250K 请求被中断后仍跑到 43%），后续请求只能排队——取消长生成并不省算力。
+- **同机做基准要每 rep 交错测量**：生产实例的负载会让同形状 cuBLAS 在 4.65 ↔ 6.78 ms 之间漂移，单次比值是噪声；另外首个测点受冷启动 boost 影响明显（53 vs 热机 76 TFLOPS），必须丢弃。
 - **边界**：全部数据来自单机 4 × T10（sm75 / 16 GB / PHB、无 NVLink），`temperature 0.5` 与 `1.0` 混用，单次结果噪声较大。换硬件、换模型或换量化格式都需重新校准，不要直接外推。
 
 ## 本分支改动清单

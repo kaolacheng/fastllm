@@ -25,7 +25,7 @@
 #
 set -euo pipefail
 
-MODEL=${MODEL:-/mnt/models/Qwen3.8-27B-Coder390-W4A4/NVFP4/W4A4}
+MODEL=${MODEL:-/home/kaolachen/workspace/models/merkyor-w4a16/NVFP4/W4A16}
 DRAFT=${DRAFT:-$MODEL/DFlash2-FP8}
 SERVED_NAME=${SERVED_NAME:-Qwen3.8 27b}   # API 里 model 字段用的正式名称
 PORT=${PORT:-8092}
